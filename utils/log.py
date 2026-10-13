@@ -1,8 +1,10 @@
 import sys
+import os
 from pathlib import Path
 from loguru import logger
 
 from conf import BASE_DIR
+LOG_ROOT = Path(os.environ.get('SAU_WORKBENCH_PRIVATE', str(BASE_DIR / '.draft-workbench')))
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -39,8 +41,9 @@ def create_logger(log_name: str, file_path: str):
     def filter_record(record):
         return record["extra"].get("business_name") == log_name
 
-    Path(BASE_DIR / file_path).parent.mkdir(exist_ok=True)
-    logger.add(Path(BASE_DIR / file_path), filter=filter_record, level="INFO", rotation="10 MB", retention="10 days", backtrace=True, diagnose=True)
+    output = LOG_ROOT / file_path
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    logger.add(output, filter=filter_record, level="INFO", rotation="10 MB", retention="10 days", backtrace=True, diagnose=True, encoding='utf-8')
     return logger.bind(business_name=log_name)
 
 

@@ -35,6 +35,7 @@ async def run(app,output):
   executable=app/'DraftWorkbench.exe';resources=app/'resources'
  backend=resources/'backend'/('PublishAssistantBackend.exe' if os.name=='nt' else 'PublishAssistantBackend')
  tools=resources/'tools'
+ initial_files={str(p.relative_to(resources)) for p in resources.rglob('*') if p.is_file() or p.is_symlink()}
  checks={'version':'1.6.1','platform':sys.platform,'checks':{}}
  server=ThreadingHTTPServer(('127.0.0.1',0),Fixture);threading.Thread(target=server.serve_forever,daemon=True).start()
  with tempfile.TemporaryDirectory(prefix='发布助手 package QA ') as tmp:
@@ -134,6 +135,12 @@ async def run(app,output):
     assert state()['editor']['payload']['title']=='本地验收作品'
     checks['checks']['material_edits_persist_after_restart']=True
     quit_app();await asyncio.to_thread(proc.wait,20)
+   final_files={str(p.relative_to(resources)) for p in resources.rglob('*') if p.is_file() or p.is_symlink()}
+   assert final_files==initial_files, {'files_added_to_application': sorted(final_files-initial_files)}
+   checks['checks']['runtime_does_not_write_inside_application']=True
+   if sys.platform=='darwin':
+    subprocess.run(['/usr/bin/codesign','--verify','--deep','--strict',str(app)],check=True,capture_output=True)
+    checks['checks']['mac_signature_remains_valid_after_runtime']=True
    checks['passed']=True
   except BaseException:
    checks['passed']=False;checks['log']=(folder/'app.log').read_text(encoding='utf-8',errors='replace')[-12000:]

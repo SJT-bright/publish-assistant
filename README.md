@@ -37,7 +37,7 @@ python -m venv .venv
 python -m pip install -r requirements-build.txt
 npm ci --prefix desktop
 python desktop/build_backend.py
-# Mac: scripts/build_media.sh mac build/media
+# Mac: MACOSX_DEPLOYMENT_TARGET=13.0 scripts/build_media.sh mac build/media
 # Windows: 使用 GitHub Actions 编译的媒体工具放入 build/media/tools
 node desktop/build.cjs
 ```

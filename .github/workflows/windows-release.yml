@@ -122,9 +122,9 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           $release = gh release view $env:RELEASE_TAG --json isDraft,targetCommitish | ConvertFrom-Json
-          if (-not $release.isDraft -or $env:RELEASE_TAG -ne 'v1.6.1') { throw 'Exact draft Release required' }
+          if (-not $release.isDraft -or $env:RELEASE_TAG -ne 'v1.6.1' -or $release.targetCommitish -ne $env:GITHUB_SHA) { throw 'Exact draft Release and source commit required' }
           $assets = Get-ChildItem release-assets -File | Where-Object { $_.Extension -in '.exe','.zip' -or $_.Name -match 'validation.json|SHA256SUMS-Windows.txt' }
-          gh release upload $env:RELEASE_TAG @($assets.FullName)
+          gh release upload $env:RELEASE_TAG @($assets.FullName) --clobber
           if ($LASTEXITCODE) { throw 'Upload failed' }
           New-Item -ItemType Directory -Path build/release-download -Force | Out-Null
           gh release download $env:RELEASE_TAG --pattern '*Windows*' --dir build/release-download
