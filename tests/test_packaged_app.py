@@ -2,6 +2,7 @@
 import argparse,asyncio,json,os,socket,subprocess,sys,tempfile,threading,time,urllib.request
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ['NO_PROXY']=os.environ.get('NO_PROXY','')+',127.0.0.1,localhost,::1'
 os.environ['no_proxy']=os.environ.get('no_proxy','')+',127.0.0.1,localhost,::1'
@@ -37,7 +38,7 @@ async def run(app,output):
  checks={'version':'1.6.1','platform':sys.platform,'checks':{}}
  server=ThreadingHTTPServer(('127.0.0.1',0),Fixture);threading.Thread(target=server.serve_forever,daemon=True).start()
  with tempfile.TemporaryDirectory(prefix='发布助手 package QA ') as tmp:
-  folder=Path(tmp);private=folder/'state';private.mkdir();profile=folder/'profile';port=free_port();base=f'http://127.0.0.1:{port}'
+  folder=Path(tmp).resolve();private=folder/'state';private.mkdir();profile=folder/'profile';port=free_port();base=f'http://127.0.0.1:{port}'
   env={**os.environ,'SAU_DESKTOP_TEST':'1','SAU_DESKTOP_TEST_URL':f'http://127.0.0.1:{server.server_port}',
        'SAU_DESKTOP_PROFILE':str(profile),'SAU_DESKTOP_STATE_DIR':str(private),'SAU_WORKBENCH_PRIVATE':str(private),
        'SAU_WORKBENCH_PORT':str(port),'SAU_EMBEDDED_DESCRIPTOR':str(private/'embedded-browser.json'),
@@ -101,8 +102,12 @@ async def run(app,output):
       child=await wait(popup);assert await child.evaluate('!!window.opener');await child.get_by_role('button',name='Close child').click()
       checks['checks']['login_popup_embedded_with_opener']=True
     checks['checks']['seven_sessions_isolated']=True
-    material=api('/api/load',{'path':str(video)})
-    checks['checks']['unicode_video_import']=True
+    await shell.get_by_role('button',name='素材工作台',exact=False).click()
+    await dashboard.get_by_text('粘贴文件夹或视频路径',exact=True).click()
+    await dashboard.locator('#path').fill(str(video));await dashboard.locator('#load').click()
+    async def imported():return await dashboard.locator('#title').input_value()=='本地验收作品'
+    await wait(imported)
+    checks['checks']['unicode_video_import_through_actual_ui']=True
     info=api('/api/media-info',{'path':str(video)});assert info['width']==160 and info['height']==90 and info['duration']>1
     checks['checks']['bundled_media_probe']=True
     cover=api('/api/frame',{'path':str(video),'time':.7,'role':'portrait','ratio':'3:4'})
@@ -111,7 +116,10 @@ async def run(app,output):
     with urllib.request.urlopen(urllib.request.Request(base+'/media?path='+urllib.parse.quote(str(video)),headers={'Range':'bytes=0-99'}),timeout=5) as response:
      assert response.status==206 and len(response.read())==100
     checks['checks']['video_preview_and_seeking_range']=True
-    api('/api/editor',{'payload':{'video':str(video),'title':'本地验收作品','description':'独立文案','tags':['生活','创作'],'cover':str(media/'封面.png')},'platforms':['kuaishou'],'browser':'embedded'})
+    await dashboard.locator('#description').fill('独立文案')
+    await dashboard.locator('input[data-platform="kuaishou"]').check()
+    await dashboard.evaluate('window.flushWorkbenchEditor()')
+    assert state()['editor']['payload']['description']=='独立文案'
     checks['checks']['unicode_material_state_saved']=True
     quit_app();await asyncio.to_thread(proc.wait,20)
     proc=launch();await wait(ready);browser=await connect(p)
