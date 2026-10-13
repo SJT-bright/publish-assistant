@@ -8,19 +8,46 @@ on:
         description: Upload tested packages to the draft Release
         type: boolean
         default: false
+      reuse_media_from:
+        description: Reuse a verified media build from an ancestor workflow run
+        type: string
+        default: ''
       tag:
         description: Exact draft release tag
         default: v1.6.1
 permissions:
   contents: write
+  actions: read
 jobs:
   media:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify reusable media provenance
+        if: ${{ inputs.reuse_media_from != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_RUN: ${{ inputs.reuse_media_from }}
+        run: |
+          source_sha="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN" --jq .head_sha)"
+          git merge-base --is-ancestor "$source_sha" HEAD
+          git diff --exit-code "$source_sha" HEAD -- scripts/build_media.sh scripts/unpack_media.py Vendor/MediaSources
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN/jobs" --jq '.jobs[] | select(.name == "media" and .conclusion == "success") | .id' > /tmp/verified-media-job
+          test -s /tmp/verified-media-job
+      - uses: actions/download-artifact@v4
+        if: ${{ inputs.reuse_media_from != '' }}
+        with:
+          name: windows-media-tools
+          path: build/media/tools
+          run-id: ${{ inputs.reuse_media_from }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install cross compiler
+        if: ${{ inputs.reuse_media_from == '' }}
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 make nasm
       - name: Build static LGPL media tools
+        if: ${{ inputs.reuse_media_from == '' }}
         run: scripts/build_media.sh windows build/media
       - uses: actions/upload-artifact@v4
         with:

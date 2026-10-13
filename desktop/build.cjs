@@ -25,8 +25,9 @@ async function build() {
       if (/\.(cjs|html|js)$/.test(f) && f!=='build.cjs') fs.copyFileSync(path.join(__dirname,f),path.join(stage,f));
     }
     fs.cpSync(path.join(ROOT,'ui-assets'),path.join(stage,'ui-assets'),{recursive:true});
-    fs.writeFileSync(path.join(stage,'runtime.json'), JSON.stringify({bundled:true}));
-    fs.writeFileSync(path.join(stage,'package.json'),JSON.stringify({name:pkg.name,productName:pkg.productName,version:pkg.version,main:pkg.main}));
+    let revision='development';try{revision=execFileSync('git',['rev-parse','HEAD'],{cwd:ROOT,encoding:'utf8'}).trim();}catch{}
+    fs.writeFileSync(path.join(stage,'runtime.json'), JSON.stringify({bundled:true,version:pkg.version,source_revision:revision}));
+    fs.writeFileSync(path.join(stage,'package.json'),JSON.stringify({name:pkg.name,productName:pkg.productName,version:pkg.version,main:pkg.main,author:pkg.author,description:pkg.description,license:'MIT'}));
     const output = await packager({dir:stage,name:'发布助手',executableName:'DraftWorkbench',platform,arch,
       electronVersion:pkg.devDependencies.electron,electronZipDir:process.env.PUBLISH_ASSISTANT_ELECTRON_ZIPS,
       out:path.join(ROOT,'dist'),overwrite:true,asar:true,appBundleId:'local.sijunting.social-auto-upload.drafts',
