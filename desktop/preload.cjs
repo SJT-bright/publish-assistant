@@ -1,0 +1,19 @@
+const {contextBridge,ipcRenderer,webUtils}=require('electron');
+contextBridge.exposeInMainWorld('draftDesktop',{
+  embedded:true,
+  copyCover:path=>ipcRenderer.invoke('cover-copy',path),
+  publicationMode:mode=>ipcRenderer.invoke('publication-mode',mode),
+  state:()=>ipcRenderer.invoke('browser-state'),
+  select:id=>ipcRenderer.invoke('browser-select',id),
+  fit:()=>ipcRenderer.invoke('browser-fit'),
+  zoom:factor=>ipcRenderer.invoke('browser-zoom',factor),
+  reload:()=>ipcRenderer.invoke('browser-reload'),
+  repairDisplay:()=>ipcRenderer.invoke('browser-repair-display'),
+  reconnect:()=>ipcRenderer.invoke('browser-reconnect'),
+  back:()=>ipcRenderer.invoke('browser-back'),
+  closePopup:()=>ipcRenderer.invoke('browser-close-popup'),
+  stopLogin:()=>ipcRenderer.invoke('browser-stop-login'),
+  choose:kind=>ipcRenderer.invoke('native-picker',kind),
+  filePath:file=>webUtils.getPathForFile(file),
+  onState:callback=>{ipcRenderer.on('browser-state',(_event,state)=>callback(state));},
+});

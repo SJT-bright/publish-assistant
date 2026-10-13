@@ -1,0 +1,9 @@
+# Local desktop draft runtime, pinned to the verified environment.
+patchright==1.58.2
+playwright==1.58.0
+loguru==0.7.3
+requests==2.32.3
+Pillow==12.3.0
+opencv-python-headless==4.13.0.92
+qrcode==8.2
+segno==1.6.6

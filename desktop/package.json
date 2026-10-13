@@ -1,0 +1,39 @@
+{
+  "name": "draft-workbench-desktop",
+  "productName": "发布助手",
+  "version": "1.6.1",
+  "main": "main.cjs",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "build": "node build.cjs",
+    "test": "node --test ../tests/*.test.cjs ../tests/test_backend_health.cjs",
+    "installer:win": "electron-builder --win nsis --x64 --publish never"
+  },
+  "devDependencies": {
+    "@electron/packager": "20.3.0",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3"
+  },
+  "author": "Publish Assistant contributors",
+  "description": "发布助手：素材准备、平台内嵌浏览器、自动上传与草稿核验",
+  "build": {
+    "appId": "local.sijunting.social-auto-upload.drafts",
+    "productName": "发布助手",
+    "directories": {
+      "output": "../release-assets"
+    },
+    "artifactName": "Publish-Assistant-${version}-Windows-${arch}-Setup.${ext}",
+    "win": {
+      "target": "nsis",
+      "icon": "AppIcon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "createDesktopShortcut": true,
+      "runAfterFinish": false
+    }
+  }
+}

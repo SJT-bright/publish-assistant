@@ -1,0 +1,2 @@
+-r requirements-draft-workbench.txt
+PyInstaller==6.16.0

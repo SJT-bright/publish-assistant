@@ -1,0 +1,248 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>发布助手</title>
+<link rel="stylesheet" href="/ui-assets/glass.css"><script src="/ui-assets/glass.js"></script><link rel="stylesheet" href="/ui-assets/material-editor.css"><script src="/ui-assets/tag-editor.js"></script><script src="/ui-assets/cover-actions.js"></script><script src="/ui-assets/material-editor.js"></script><script src="/ui-assets/field-overrides.js"></script><link rel="stylesheet" href="/ui-assets/field-overrides.css">
+<style>
+#platformPanel #platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));column-gap:10px;align-content:start}
+#platformPanel #platforms>.platform{min-width:0}
+.tile[data-brand="toutiao"]{background:linear-gradient(145deg,#ff8d82,#d94038)}
+.tile[data-brand="xigua"]{background:linear-gradient(145deg,#80c98d,#378653)}
+#uploadIssues{margin-top:12px;padding:12px 15px;border:1px solid #d6a95066;border-radius:14px;background:#fff6e5c9;color:#775219}
+#uploadIssues[hidden]{display:none}
+#uploadIssuesHeading{margin:0 0 7px;font-size:12px;font-weight:600}
+.upload-issue{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;margin:7px 0;font-size:12px}
+.upload-issue span{flex:1 1 220px;overflow-wrap:anywhere}
+.upload-issue button{flex:none}
+#tagChoiceDialog{width:min(520px,calc(100vw - 70px));border:1px solid #fff;border-radius:20px;background:#edf3fff5;color:#233752;padding:24px;box-shadow:0 20px 80px #172e6040}
+#tagChoiceDialog::backdrop{background:#172e6040;backdrop-filter:blur(5px)}
+#tagChoiceOptions{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}
+.tag-choice{display:flex;align-items:center;gap:7px;padding:9px 12px;border:1px solid #9bb8df88;border-radius:12px;background:#ffffff90;cursor:pointer;font-size:13px}
+.tag-choice input{accent-color:#4377d3;width:16px;height:16px;margin:0}
+#tagChoiceCount{font-size:13px;color:#567a71}
+#tagChoiceCount.limit-error{color:#a34542}
+@media(max-width:610px){#platformPanel #platforms{grid-template-columns:1fr}}
+</style>
+<body class="workbench-v2"><main>
+<header class="hero"><div><p class="eyebrow"><span data-symbol="layers"></span>创 作 工 作 空 间</p><h1>发布助手</h1><p class="sub">素材填一次，草稿送到你选的平台。</p></div><div class="hero-art" data-tilt aria-hidden="true"><div class="art-scene"><div class="art-shadow"></div><div class="art-card back"></div><div class="art-card mid"></div><div class="art-card"><span data-symbol="film"></span><div class="art-lines"><i></i><i></i><i></i></div></div><div class="art-bubble" data-symbol="check"></div></div></div></header>
+<div id="notice" role="alert"></div>
+<div class="grid">
+<section id="platformPanel" class="panel glass"><div class="section-head"><span class="step">01</span><div><h2>选择平台</h2><p class="section-caption">选好平台，素材只需准备一次</p></div><span id="selectedCount" class="selection-summary" aria-live="polite">选择需要的平台</span></div>
+<div id="platforms"></div>
+<div class="actions"><span class="hint grow">上传入口：准备好素材后，点击右侧蓝色按钮。自动上传视频、填写内容与封面，只保存草稿。</span><button id="precheck">检查素材</button><button class="primary" id="save" aria-describedby="uploadIssues"><span data-symbol="layers" aria-hidden="true"></span><span id="saveLabel">开始上传并保存草稿</span></button><button id="cancel" disabled>停止</button></div>
+<div id="uploadIssues" role="alert" hidden><p id="uploadIssuesHeading">需要先调整以下素材；点击对应按钮，只修改这个平台。</p><div id="uploadIssueList"></div></div>
+<p id="resultContext" class="hint" aria-live="polite" hidden></p><div id="results" aria-live="polite"></div><details id="runDetails"><summary>运行记录</summary><pre id="logs">暂无任务</pre></details><details><summary>最近任务</summary><div id="history" class="muted">暂无历史任务</div></details>
+</section>
+<section id="materialPanel" class="panel glass"><div class="section-head"><span class="step">02</span><div><h2>准备素材</h2><p class="section-caption">拖入素材、选帧做封面，编辑自动保留</p></div><span class="material-mark">本机素材库</span></div>
+<div class="material-workspace">
+<div class="preview-column">
+<div id="videoDrop" class="import-zone row" tabindex="0" aria-label="拖入视频或素材文件夹"><div class="import-icon" data-symbol="folder"></div><div class="grow import-text">把视频或素材文件夹拖到这里<small>自动读取同目录文案和封面，也可分别导入</small><div class="import-buttons"><button id="folder">选择素材文件夹</button><button id="file">选择视频</button></div></div></div>
+<input id="videoFileInput" type="file" accept=".mp4,.mov,.m4v,.webm,.avi,.mkv" hidden>
+<label class="field" for="video">当前视频</label><select id="video"><option value="">还未选择</option></select><div class="file file-name" id="videoPath"></div>
+<div class="player-stage"><video id="videoPlayer" controls preload="metadata" playsinline hidden></video><div id="videoEmpty"><span data-symbol="film"></span><strong>预览你的作品</strong><span>导入视频后，拖动进度条选择封面帧</span></div></div>
+<div class="timeline"><input id="seek" type="range" min="0" max="0" step="0.01" value="0" disabled aria-label="选择视频帧时间"><div class="time-readout"><input id="frameTime" type="number" min="0" step="0.01" value="0" disabled aria-label="截帧秒数"><span id="videoDuration">/ 0.00 秒</span></div></div>
+<div class="capture-controls"><label for="captureRole">截帧用作</label><select id="captureRole"><option value="landscape">横版封面</option><option value="portrait">竖版封面</option><option value="common">通用封面</option></select><select id="captureRatio" aria-label="封面比例"><option value="16:9">横版 16:9</option><option value="4:3">横版 4:3</option><option value="3:4">竖版 3:4</option><option value="9:16">竖版 9:16</option><option value="original">视频原比例</option></select><button id="captureFrame" disabled>截取当前帧</button></div><p id="frameStatus" class="hint" aria-live="polite">横竖比例可选；调整比例时保留完整画面，余白用模糊背景填充。</p>
+<details class="path-fallback"><summary>粘贴文件夹或视频路径</summary><div class="row"><input type="text" id="path" placeholder="/Users/…/素材"><button id="load">读取</button></div></details>
+</div>
+<div class="copy-column">
+<div data-text-drop="title" class="text-drop"><div class="field-head"><label class="field" for="title">统一标题</label><button class="small ghost" data-text-pick="title">导入文字</button></div><input type="text" id="title" placeholder="输入标题，或拖入文字 / TXT 文件"><p id="titleLimit" class="hint">选择视频后默认用文件名；按已选平台实时检查。</p></div>
+<div data-text-drop="description" class="text-drop"><div class="field-head"><label class="field" for="description">统一文案 / 简介</label><button class="small ghost" data-text-pick="description">导入文案</button></div><textarea id="description" placeholder="输入文案，或拖入文字 / TXT / Markdown 文件"></textarea><p id="descriptionLimit" class="hint"></p></div>
+<div class="field-head"><label class="field" for="tagInput">话题标签</label><button id="tagSuggest" class="small ghost">提取文案中的 #话题</button></div>
+<div id="tagEditor"><div id="tagChips" aria-label="已添加标签"></div><input type="text" id="tagInput" placeholder="#生活 #创作 #日常" aria-label="添加话题标签"><input id="tags" type="hidden"></div><div id="tagSuggestions" aria-live="polite"></div><p id="tagHint" class="hint">输入 #话题、逗号或回车，自动识别并去重。保存时按平台适配。</p>
+<div id="tagOverrides"></div><div id="textLimitIssues" class="hint" role="alert"></div><label class="field" for="shortTitle">视频号短标题 <span class="muted">可留空</span></label><input type="text" id="shortTitle" placeholder="填写时需 6–16 字">
+</div></div>
+<div class="cover-section-head"><h3>封面工作区</h3><span class="hint">直接拖入图片，或从视频截取。横版与竖版分别保存。</span></div>
+<div class="cover-grid">
+<div class="cover-slot" data-cover-slot="common"><div class="cover-heading"><strong>通用封面</strong><span>缺少专用封面时使用</span></div><div class="cover-stage"><img id="coverPreview" alt="通用封面" hidden><div class="cover-placeholder"><span data-symbol="image"></span>拖入封面图片</div></div><div class="cover-caption" id="coverName">未选择封面</div><div class="cover-buttons"><button id="coverPick" data-cover-pick="common">选择图片</button><button id="coverClear" data-cover-clear="common">清除</button></div></div>
+<div class="cover-slot" data-cover-slot="landscape"><div class="cover-heading"><strong>横版封面</strong><span>适合横向展示</span></div><div class="cover-stage"><img id="coverLandscapePreview" alt="横版封面" hidden><div class="cover-placeholder"><span data-symbol="image"></span>拖入图片，或在上方截帧</div></div><div class="cover-caption" id="coverLandscapeName">未选择横版封面</div><div class="cover-buttons"><button data-cover-pick="landscape">选择图片</button><button data-cover-clear="landscape">清除</button></div><input type="hidden" id="coverLandscape"></div>
+<div class="cover-slot" data-cover-slot="portrait"><div class="cover-heading"><strong>竖版封面</strong><span>适合竖向展示</span></div><div class="cover-stage"><img id="coverPortraitPreview" alt="竖版封面" hidden><div class="cover-placeholder"><span data-symbol="image"></span>拖入你的竖版封面</div></div><div class="cover-caption" id="coverPortraitName">未选择竖版封面</div><div class="cover-buttons"><button data-cover-pick="portrait">选择图片</button><button data-cover-clear="portrait">清除</button></div><input type="hidden" id="coverPortrait"></div>
+</div>
+<details><summary>平台专用封面与短标题</summary><div id="overrides"></div></details><p id="editorSaved" class="saved">编辑内容与所选平台会保存在本机。</p>
+</section>
+<section class="panel glass wide"><div class="preview-title"><div class="section-head"><span class="step">03</span><h2>实际填入内容</h2></div><span id="previewState" class="muted">选择素材与平台后预检</span></div><ul id="issues" class="issues" role="alert"></ul><div id="preview" class="preview"></div></section>
+</div>
+<footer><div class="footer-line"><details><summary>草稿保存位置与核验说明</summary><p>抖音和小红书草稿保存在当前浏览器的数据中，清除浏览器数据会丢失；视频号和 B站使用平台草稿，快手使用平台单份暂存快照。只有重开后核验内容、封面、视频和账号都通过，才显示完成。未知结果或风险提示会阻止自动重传。</p></details><span class="footer-mark">本机工作台 · Alpine Dawn</span></div></footer>
+</main>
+<dialog id="retryDialog" aria-labelledby="retryTitle" style="max-width:520px;border:1px solid #fff;border-radius:20px;background:#edf3fff5;color:#233752;padding:24px;box-shadow:0 20px 80px #172e6040">
+<h2 id="retryTitle">恢复本平台上传</h2><p id="retryMessage"></p><p id="retryHint" class="hint">本次只处理当前平台，旧记录会保留。</p>
+<div class="actions"><button id="retryInspect">打开平台检查草稿</button><button id="retryCancel">取消</button><button id="retryConfirm" class="primary">开始本次重新上传</button></div>
+</dialog>
+<dialog id="tagChoiceDialog" aria-labelledby="tagChoiceTitle">
+<h2 id="tagChoiceTitle">设置平台独立话题</h2><p id="tagChoiceHint" class="hint"></p>
+<div id="tagChoiceOptions"></div><p id="tagChoiceCount" aria-live="polite"></p>
+<div class="actions"><button id="tagChoiceCancel">取消</button><button id="tagChoiceApply" class="primary">保存独立话题</button></div>
+</dialog>
+<script>
+let fieldOverrides=null,textCheckTimer=null,textCheckSequence=0,platformPolicies={},liveSessions={};
+let textIssues=[],textFeedback={},tagChoiceTarget=null;
+let token='',material={},busy=false,cardInit=false,restored=false,editorTimer=null,connectionLost=false,currentAction='',retryTarget=null,retryMode='retry',renderedResults='';
+let submitting=false,submitPhase='',checking=false;
+const $=id=>document.getElementById(id), embedded=!!(window.draftDesktop||window.webkit?.messageHandlers?.nativePicker);
+document.documentElement.classList.toggle('embedded',embedded);
+const platformNames={}, verified=new Set(['local_draft_verified','platform_draft_verified','platform_snapshot_verified']);
+const platformIcon=id=>window.DraftVisual.icon(id);
+const statusLabels={local_draft_verified:'本地草稿已核验',platform_draft_verified:'平台草稿已核验',platform_snapshot_verified:'暂存快照已核验',login_verified:'最近登录已验证',result_unknown:'结果待确认',saved_unverified:'保存待核验',risk_paused:'风险暂停',platform_restricted:'平台权限受限',adapter_mismatch:'页面控件待适配',needs_reauthentication:'需要重新登录',account_mismatch:'账号待确认',failed:'执行失败',cancelled:'已停止',pending:'等待执行',running:'正在处理'};
+function notice(text){$('notice').textContent=text;$('notice').style.display=text?'block':'none';}
+function updateActions(){
+ const locked=busy||submitting||checking;
+ const hasSelectedPlatform=selected().length>0;
+ // Content issues must have an actionable entry. Preflight still gates every upload.
+ $('save').disabled=locked||!hasSelectedPlatform;
+ $('save').title=textIssues.length?'素材需要调整：'+textIssues.map(e=>(platformNames[e.platform]||'')+' · '+e.message).join('；'):'检查素材后，上传并保存到所选平台草稿';
+ $('save').setAttribute('aria-busy',String(submitting||busy));
+ $('saveLabel').textContent=submitting?submitPhase:busy?(currentAction==='login'?'等待登录验证…':'正在上传并保存草稿…'):'开始上传并保存草稿';
+ $('precheck').disabled=locked||!hasSelectedPlatform;$('precheck').textContent=checking?'正在检查素材…':'检查素材';
+ $('cancel').disabled=!busy;
+ for(const button of document.querySelectorAll('.login'))button.disabled=submitting||checking||busy&&!(currentAction==='login'&&window.draftDesktop);
+}
+async function request(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json','X-Workbench-Token':token},body:JSON.stringify(body)});const d=await r.json();if(!r.ok)throw new Error(d.error||'操作失败');return d.result;}
+function selected(){return [...document.querySelectorAll('[data-platform]:checked')].filter(c=>!c.disabled).map(c=>c.dataset.platform);}
+window.flushWorkbenchEditor=async()=>{if(!restored||!token)return;clearTimeout(editorTimer);await request('/api/editor',{payload:payload(),platforms:selected()});};
+function tags(value){return window.TagEditor.parse(value);}
+function payload(){return {...material,video:$('video').value,title:$('title').value,description:$('description').value,tags:tagController.get(),cover_landscape:$('coverLandscape').value.trim(),cover_portrait:$('coverPortrait').value.trim(),short_title:$('shortTitle').value.trim(),platform_overrides:fieldOverrides?.get()||material.platform_overrides||{}};}
+function selectionSummary(){const count=selected().length;$('selectedCount').textContent=count?'已选择 '+count+' 个':'选择需要的平台';if(window.TagEditor)tagHint();}
+function dirty(){fieldOverrides?.refresh();selectionSummary();scheduleTextCheck();if(!restored)return;$('previewState').textContent='内容已改动，请重新预检';$('preview').replaceChildren();$('issues').replaceChildren();$('editorSaved').textContent='正在保存本地编辑…';clearTimeout(editorTimer);editorTimer=setTimeout(async()=>{try{await request('/api/editor',{payload:payload(),platforms:selected()});$('editorSaved').textContent='编辑内容与所选平台已保存在本机';}catch(e){$('editorSaved').textContent='本地编辑未保存：'+e.message;}},400);}
+function setOverrides(values={}){fieldOverrides?.set(values);for(const [id] of Object.entries(platformNames)){const keys=['short_title','cover','cover_landscape','cover_portrait'];const enabled=keys.some(k=>Object.hasOwn(values[id]||{},k));$('override-'+id).checked=enabled;$('override-fields-'+id).style.display=enabled?'block':'none';for(const key of keys){const field=$('override-'+id+'-'+key);if(field)field.value=values[id]?.[key]??'';if(key.startsWith('cover'))renderOverrideCover(id,key);}}}
+
+function renderMaterial(m){material=m;$('path').value=m.folder||'';const videos=m.videos?.length?m.videos:m.video?[m.video]:[];$('video').replaceChildren(...videos.map(v=>{const o=document.createElement('option');o.value=v;o.textContent=v.split('/').pop();return o;}));if(!videos.length){const o=document.createElement('option');o.value='';o.textContent='还未选择';$('video').append(o);}$('video').value=m.video||'';$('videoPath').textContent=m.video?m.video.split('/').pop():'';$('title').value=m.title||'';$('description').value=m.description||'';tagController.set(m.tags||[]);$('coverLandscape').value=m.cover_landscape||'';$('coverPortrait').value=m.cover_portrait||'';$('shortTitle').value=m.short_title||'';setOverrides(m.platform_overrides);renderCover();if(m.cover_generation_error)notice(m.cover_generation_error);}
+function renderCover(){materialEditor.update({...material,cover_landscape:$('coverLandscape').value,cover_portrait:$('coverPortrait').value});}
+const nativeRequests=new Map();window.__resolveNativePicker=(id,path,error)=>{const p=nativeRequests.get(id);if(!p)return;nativeRequests.delete(id);error?p.reject(new Error(error)):p.resolve(path);};
+function nativePick(kind){return new Promise((resolve,reject)=>{const id=crypto.randomUUID();nativeRequests.set(id,{resolve,reject});window.webkit.messageHandlers.nativePicker.postMessage({id,kind});});}
+async function choose(kind){notice('');try{if(embedded){const path=window.draftDesktop?await window.draftDesktop.choose(kind):await nativePick(kind);if(path)await loadVideo(path);}else{const sequence=++videoImportSequence;const data=await request('/api/choose',{kind});if(data&&sequence===videoImportSequence){renderMaterial(data);dirty();}}}catch(e){notice(e.message);}}
+$('folder').onclick=()=>choose('folder');$('file').onclick=()=>choose('video');
+$('load').onclick=()=>loadVideo($('path').value).catch(e=>notice(e.message));
+$('video').onchange=()=>loadVideo(material.folder,$('video').value).catch(e=>notice(e.message));
+for(const id of ['title','description','tags','coverLandscape','coverPortrait','shortTitle'])$(id).addEventListener('input',dirty);
+function paragraph(parent,label,value){const p=document.createElement('p'),b=document.createElement('b');b.textContent=label+'：';p.append(b,document.createTextNode(value||'（留空）'));parent.append(p);}
+function renderCheck(check){setTextIssues(check.errors);$('preview').replaceChildren();$('issues').replaceChildren();for(const issue of [...check.errors,...check.warnings]){const li=document.createElement('li');li.className=check.errors.includes(issue)?'error':'';li.textContent=(platformNames[issue.platform]?platformNames[issue.platform]+' · ':'')+issue.message;$('issues').append(li);}for(const [id,fields] of Object.entries(check.mappings)){const box=document.createElement('div');box.className='mapping';const h=document.createElement('h3');h.textContent=platformNames[id]+' · '+check.policies[id].label;box.append(h);paragraph(box,'标题 ('+fields.title.length+' 字)',fields.title);if(Object.hasOwn(fields,'caption'))paragraph(box,'作品描述完整文本',fields.caption);else{paragraph(box,'文案',fields.description);paragraph(box,'标签',fields.tags.map(t=>'#'+t).join(' '));}if(Object.hasOwn(fields,'short_title'))paragraph(box,'短标题',fields.short_title);for(const key of ['cover','cover_landscape','cover_portrait'])if(Object.hasOwn(fields,key))paragraph(box,{cover:'封面',cover_landscape:'横版封面',cover_portrait:'竖版封面'}[key],fields[key]?fields[key].split('/').pop():'未选择自定义图片');const hash=document.createElement('p');hash.className='muted';hash.textContent='素材指纹 '+check.fingerprints[id].video_sha256.slice(0,12)+' · 文本 '+check.fingerprints[id].content_sha256.slice(0,12);box.append(hash);$('preview').append(box);}$('previewState').textContent=check.errors.length?'预检未通过':'预检通过 · 保存前还会现场检查平台';}
+async function check(){const data={platforms:selected(),payload:payload(),browser:embedded?'embedded':'external'};await request('/api/editor',data);$('editorSaved').textContent='编辑内容与所选平台已保存在本机';const result=await request('/api/preflight',data);renderCheck(result);return {data,result};}
+$('precheck').onclick=async()=>{if(busy||submitting||checking)return;notice('');checking=true;updateActions();try{await check();}catch(e){notice(e.message);}finally{checking=false;updateActions();}};
+async function start(action,platforms){
+ if(busy||submitting||checking)return;
+ notice('');submitting=true;submitPhase=action==='draft'?'正在检查素材…':'正在启动登录…';updateActions();
+ try{
+  let data={action,platforms,browser:embedded?'embedded':'external'};
+  if(action==='draft'){
+   const checked=await check();
+   if(checked.result.errors.length){await updateTextCheck();setTextIssues(checked.result.errors);notice('素材预检未通过：'+checked.result.errors.map(e=>(platformNames[e.platform]||'')+' · '+e.message).join('；'));submitting=false;updateActions();openTextIssue(checked.result.errors[0]);return;}
+   data={...checked.data,action};submitPhase='正在启动上传…';updateActions();
+  }
+  await request('/api/start',data);await refresh();
+ }catch(e){notice(e.message);}
+ finally{submitting=false;submitPhase='';updateActions();}
+}
+$('save').onclick=()=>start('draft',selected());$('cancel').onclick=async()=>{try{await request('/api/cancel',{});await refresh();}catch(e){notice(e.message);}};
+function renderOverrideCover(id,key){const path=$('override-'+id+'-'+key).value,img=$('override-'+id+'-'+key+'-preview');img.hidden=!path;if(path)img.src='/asset?path='+encodeURIComponent(path);else img.removeAttribute('src');$('override-'+id+'-'+key+'-name').textContent=path?path.split('/').pop():'未设置专用图片';}
+function makeCards(platforms){for(const p of platforms){
+ platformNames[p.id]=p.name;
+ const automationReady=p.automation_ready!==false;
+ const row=document.createElement('div');row.className='platform';
+ const c=document.createElement('input');c.type='checkbox';c.dataset.platform=p.id;c.disabled=!automationReady;c.title=automationReady?'选择 '+p.name+' 进行草稿保存':p.readiness_message||'视频草稿适配待完成';c.setAttribute('aria-label',p.name+'草稿');c.onchange=dirty;
+ const icon=document.createElement('span');icon.className='icon tile';icon.dataset.brand=p.id;icon.innerHTML=platformIcon(p.id);
+ const text=document.createElement('div');text.className='grow';const name=document.createElement('div');name.className='name';name.textContent=p.name;name.title=p.name+' · '+p.policy.label;
+ const st=document.createElement('div');st.className='status';st.id='status-'+p.id;text.append(name,st);
+ const button=document.createElement('button');button.className='small login';button.dataset.id=p.id;button.textContent=automationReady?'登录':'打开平台';button.onclick=()=>{if(!automationReady){if(window.draftDesktop)window.draftDesktop.select(p.id).catch(e=>notice(e.message));else notice(p.readiness_message||'请在桌面应用中打开平台；视频草稿适配待完成。');return;}if(busy&&currentAction==='login'&&window.draftDesktop)window.draftDesktop.select(p.id).catch(e=>notice(e.message));else if(liveSessions[p.id]?.status==='login_verified'&&window.draftDesktop)window.draftDesktop.select(p.id).catch(e=>notice(e.message));else start('login',[p.id]);};
+ row.append(c,icon,text,button);row.addEventListener('click',event=>{if(!event.target.closest('button,input'))c.click();});$('platforms').append(row);
+ const section=document.createElement('div');section.className='override';const label=document.createElement('label');const enabled=document.createElement('input');enabled.type='checkbox';enabled.id='override-'+p.id;label.append(enabled,document.createTextNode(' '+p.name+' 专用封面与短标题'));
+ const fields=document.createElement('div');fields.className='override-fields';fields.id='override-fields-'+p.id;
+ for(const key of [...(p.id==='tencent'?['short_title']:[]),'cover','cover_landscape','cover_portrait']){
+  const caption=document.createElement('label');caption.className='field';caption.textContent={title:'标题',description:'文案',tags:'标签（支持 #话题）',short_title:'视频号短标题',cover:'通用封面',cover_landscape:'横版封面',cover_portrait:'竖版封面'}[key];caption.htmlFor='override-'+p.id+'-'+key;
+  const input=document.createElement(key==='description'?'textarea':'input');input.type=key.startsWith('cover')?'hidden':'text';input.id=caption.htmlFor;input.addEventListener('input',()=>{fieldOverrides?.setField(p.id,key,input.value);dirty();});fields.append(caption,input);
+  if(key.startsWith('cover')){
+   const slot=document.createElement('div');slot.className='override-cover';slot.dataset.overrideCover=p.id+':'+key;
+   const img=document.createElement('img');img.id=input.id+'-preview';img.alt=p.name+' '+caption.textContent;img.hidden=true;
+   const filename=document.createElement('span');filename.className='grow';filename.id=input.id+'-name';filename.textContent='拖入专用封面图片';
+   const pickButton=document.createElement('button');pickButton.className='small';pickButton.textContent='选择图片';
+   const clear=document.createElement('button');clear.className='small';clear.textContent='清除';let version=0;
+   async function importImage(path){const seq=++version;const registered=await request('/api/cover',{path});if(seq!==version)return;input.value=registered;fieldOverrides?.setField(p.id,key,registered);renderOverrideCover(p.id,key);dirty();notice('');}
+   window.CoverActions?.attach({element:slot,getPath:()=>input.value,copy:path=>window.draftDesktop?.copyCover(path),notice,onDropPath:(_host,path)=>importImage(path)});
+   pickButton.onclick=async()=>{try{const path=window.draftDesktop?await window.draftDesktop.choose('cover'):await nativePick('cover');if(path)await importImage(path);}catch(e){notice(e.message);}};
+   clear.onclick=()=>{version++;input.value='';fieldOverrides?.unsetField(p.id,key);renderOverrideCover(p.id,key);dirty();};
+   slot.ondragover=e=>{if([...e.dataTransfer.types].includes('Files')){e.preventDefault();slot.classList.add('drop-active');}};
+   slot.ondragleave=()=>slot.classList.remove('drop-active');slot.ondrop=async e=>{e.preventDefault();e.stopPropagation();slot.classList.remove('drop-active');try{const file=e.dataTransfer.files[0];if(!file)return;const path=window.draftDesktop?.filePath(file);if(!path)throw new Error('请在 App 中拖入封面图片。');await importImage(path);}catch(err){notice(err.message);}};
+   slot.append(img,filename,pickButton,clear);fields.append(slot);
+  }
+ }
+ enabled.onchange=()=>{fields.style.display=enabled.checked?'block':'none';if(!enabled.checked)for(const key of ['short_title','cover','cover_landscape','cover_portrait'])fieldOverrides?.unsetField(p.id,key);dirty();};section.append(label,fields);$('overrides').append(section);
+}fieldOverrides=window.FieldOverrides.mount({platforms,getGlobal:()=>({title:$('title').value,description:$('description').value,tags:tagController.get()}),onChange:dirty});fieldOverrides.add('title',document.querySelector('[data-text-drop=title]'));fieldOverrides.add('description',document.querySelector('[data-text-drop=description]'));fieldOverrides.add('tags',$('tagOverrides'));cardInit=true;}
+
+function renderResults(job){const context=$('resultContext');context.hidden=!job;context.textContent=job?(job.active?'执行中 · ':'最近任务 · ')+dateText(job.created_at,'时间未记录')+(job.active?' · 下方结果对应本次任务提交的素材。':' · 下方回执对应上次任务提交的素材。'):'';const logText=job?.logs?.join('\n')||'暂无运行记录';if($('logs').textContent!==logText){const follow=$('logs').scrollHeight-$('logs').scrollTop-$('logs').clientHeight<32;$('logs').textContent=logText;if(follow)$('logs').scrollTop=$('logs').scrollHeight;}const signature=JSON.stringify(job?{id:job.id,active:job.active,action:job.action,browser:job.browser,results:job.results}:null);if(signature===renderedResults)return;renderedResults=signature;$('results').replaceChildren();if(!job)return;for(const item of job.results){const div=document.createElement('div');div.className='result '+(verified.has(item.status)||item.status==='login_verified'?'good':['risk_paused','platform_restricted','adapter_mismatch','failed','account_mismatch','needs_reauthentication'].includes(item.status)?'bad':['result_unknown','saved_unverified'].includes(item.status)?'pending':'');const message=String(item.message||'');const expanded=message.includes('\n')||message.length>240||/Locator\.[a-z_]+: Timeout/.test(message);const stage=item.progress?.label||'当前步骤';const summary=/Locator\.[a-z_]+: Timeout/.test(message)?'操作超时，停在'+stage+'；已保留素材。':message.split('\n')[0].slice(0,240);div.textContent=item.name+' · '+summary;const small=document.createElement('small');small.textContent=(statusLabels[item.status]||'待确认')+(item.reused?' · 来自历史任务 '+item.previous_job_id:'');div.append(small);if(item.progress){const steps=document.createElement('small');steps.textContent='原记录步骤：'+stage+' · 已完成 '+(item.progress.completed||[]).length+'/7 步'+((item.progress.skipped||[]).length?' · 跳过 '+item.progress.skipped.length+' 步':'');div.append(steps);}if(expanded){const details=document.createElement('details');const label=document.createElement('summary');label.textContent='查看详细原因';const text=document.createElement('pre');text.style.whiteSpace='pre-wrap';text.style.overflowWrap='anywhere';text.textContent=message;details.append(label,text);div.append(details);}
+if(!job.active&&job.action==='draft'){const actions=document.createElement('div');actions.className='actions';actions.style.marginTop='8px';if(window.draftDesktop){const inspect=document.createElement('button');inspect.className='small';inspect.textContent='打开'+item.name+'页面';inspect.onclick=()=>window.draftDesktop.select(item.platform).catch(e=>notice(e.message));actions.append(inspect);}if(item.resumable){const resume=document.createElement('button');resume.className='small';resume.textContent='继续已上传素材';resume.onclick=()=>{retryMode='resume';retryTarget={expected_job_id:job.id,platform:item.platform,previous_job_id:item.resume_previous_job_id,browser:job.browser};$('retryTitle').textContent='继续'+item.name+'的已上传素材';$('retryMessage').textContent='继续原任务 '+(item.resume_previous_job_id||job.id)+' 的已上传视频，从内容和封面继续，保存后重新打开核验。';$('retryHint').textContent='先核对当前平台页面。页面中的视频必须与本次素材一致；不会再次上传视频。';$('retryConfirm').textContent='继续填写并保存草稿';$('retryConfirm').disabled=false;$('retryDialog').showModal();};actions.append(resume);}if(item.retryable&&!item.resumable){const retry=document.createElement('button');retry.className='small';retry.textContent='重新上传'+item.name;retry.onclick=()=>{retryMode='retry';retryTarget={expected_job_id:job.id,platform:item.platform,previous_job_id:item.retry_previous_job_id,browser:job.browser};$('retryTitle').textContent='重新上传'+item.name;$('retryMessage').textContent='上次任务未完成或未核验。确认平台没有需要保留的同素材草稿后，可以重新执行一次上传。';$('retryHint').textContent='先检查平台草稿箱。旧记录保留，本次只重新上传这个平台。';$('retryConfirm').textContent='开始本次重新上传';$('retryConfirm').disabled=false;$('retryDialog').showModal();};actions.append(retry);}if(actions.children.length)div.append(actions);}
+$('results').append(div);}}
+$('retryCancel').onclick=()=>{$('retryDialog').close();retryTarget=null;};
+$('retryInspect').onclick=async()=>{if(!retryTarget)return;const platform=retryTarget.platform;$('retryDialog').close();retryTarget=null;try{await window.draftDesktop?.select(platform);}catch(e){notice(e.message);}};
+$('retryConfirm').onclick=async()=>{
+ if(!retryTarget||busy||submitting||checking)return;
+ submitting=true;submitPhase=retryMode==='resume'?'正在继续已上传素材…':'正在启动本平台上传…';updateActions();
+ $('retryConfirm').disabled=true;const target=retryTarget;
+ try{await request('/api/editor',{payload:payload(),platforms:selected()});await request(retryMode==='resume'?'/api/resume':'/api/retry',{...target,payload:payload()});$('retryDialog').close();retryTarget=null;await refresh();}
+ catch(e){$('retryMessage').textContent=e.message;}
+ finally{submitting=false;submitPhase='';updateActions();if(retryTarget)$('retryConfirm').disabled=busy;}
+};
+function dateText(value,fallback='曾验证'){if(value==null||value==='')return fallback;const date=new Date(typeof value==='number'?value*1000:value);return isNaN(date)?fallback:date.toLocaleString('zh-CN');}
+async function refresh(){try{const r=await fetch('/api/state'+(embedded?'?embedded=1':''),{cache:'no-store'});if(!r.ok)throw new Error('工作台连接中断');const s=await r.json();if(connectionLost){notice('');connectionLost=false;}token=s.token;busy=!!s.job?.active;currentAction=busy?s.job.action:'';if(!cardInit)makeCards(s.platforms);if(!restored){if(s.editor?.payload)renderMaterial(s.editor.payload);for(const id of s.editor?.platforms||[]){const checkbox=document.querySelector('[data-platform="'+id+'"]');if(checkbox&&!checkbox.disabled)checkbox.checked=true;}restored=true;selectionSummary();if(s.editor?.updated_at)$('editorSaved').textContent='已恢复上次本地编辑与平台选择';scheduleTextCheck();}for(const p of s.platforms){liveSessions[p.id]=p.current_session||{};platformPolicies[p.id]=p.policy;const live=liveSessions[p.id];const status=$('status-'+p.id);const loginButton=document.querySelector('.login[data-id="'+p.id+'"]');if(p.automation_ready===false){status.textContent=p.readiness_message||'视频草稿适配待完成';loginButton.disabled=submitting||checking;loginButton.textContent='打开平台';}else{status.textContent=live.status==='login_verified'?'已登录 · 当前页面已确认':live.status==='needs_reauthentication'?'待登录 · 在 App 内完成认证':p.last_verified_at?'最近验证 '+dateText(p.last_verified_at)+' · 页面待确认':(p.session_record_present?'会话已保留 · 页面待确认':'打开平台页确认登录');loginButton.disabled=busy&&!(currentAction==='login'&&window.draftDesktop);loginButton.textContent=busy&&currentAction==='login'&&window.draftDesktop||live.status==='login_verified'?'打开':'登录';}}updateActions();renderResults(s.job);$('history').replaceChildren();for(const job of [...s.history].reverse()){const div=document.createElement('p');div.textContent=job.id+' · '+job.results.map(i=>i.name+' '+i.message).join(' / ');$('history').append(div);}if(!s.history.length)$('history').textContent='暂无历史任务';}catch(e){connectionLost=true;notice('工作台连接暂时中断，正在自动重连；编辑内容仍保留在本机。');}}
+const tagController=window.TagEditor.attach({input:$('tagInput'),chips:$('tagChips'),hidden:$('tags'),suggestions:$('tagSuggestions'),onChange:()=>{tagHint();dirty();}});
+function tagHint(){$('tagHint').textContent=(tagController.get().length?'已添加 '+tagController.get().length+' 个话题。':'')+'支持 #话题、逗号、空格与回车；各平台数量与字数在下方实时检查。';}
+function setTextIssues(errors=[]){
+ textIssues=errors.filter(e=>selected().includes(e.platform));
+ $('textLimitIssues').textContent=textIssues.map(e=>(platformNames[e.platform]||e.platform)+'：'+e.message).join('；');
+ $('textLimitIssues').classList.toggle('limit-error',!!textIssues.length);
+ $('uploadIssues').hidden=!textIssues.length;$('uploadIssueList').replaceChildren();
+ for(const issue of textIssues){
+  const row=document.createElement('div');row.className='upload-issue';
+  const message=document.createElement('span');message.textContent=(platformNames[issue.platform]||issue.platform)+' · '+issue.message;row.append(message);
+  const fieldName={title:'标题',description:'文案',tags:'话题',short_title:'短标题'}[issue.field];
+  if(fieldName){const button=document.createElement('button');button.type='button';button.className='small';button.textContent='设置'+(platformNames[issue.platform]||issue.platform)+'独立'+fieldName;button.onclick=()=>openTextIssue(issue);row.append(button);}
+  $('uploadIssueList').append(row);
+ }
+ updateActions();
+}
+function openTextIssue(issue){
+ if(busy||submitting||checking)return;
+ if(issue.field==='tags'&&openTagChoices(issue.platform))return;
+ if(issue.field==='short_title'){$('shortTitle').scrollIntoView?.({block:'center'});$('shortTitle').focus();return;}
+ fieldOverrides?.open(issue.field,issue.platform);
+}
+function openTagChoices(platform){
+ const maximum=textFeedback[platform]?.tags?.max;
+ if(!Number.isSafeInteger(maximum)||maximum<=0)return false;
+ const values=fieldOverrides?.resolve(platform,'tags');
+ if(!Array.isArray(values))return false;
+ tagChoiceTarget={platform,maximum,original:JSON.stringify(values)};
+ $('tagChoiceTitle').textContent='设置'+(platformNames[platform]||platform)+'独立话题';
+ $('tagChoiceHint').textContent='当前采用的额度最多 '+maximum+' 个。勾选要保留的话题，再保存；统一话题和其他平台的设置会保留。';
+ $('tagChoiceOptions').replaceChildren();
+ for(const tag of values){const label=document.createElement('label');label.className='tag-choice';const input=document.createElement('input');input.type='checkbox';input.checked=true;input.value=tag;input.setAttribute('aria-label','保留话题 #'+tag);input.addEventListener('change',updateTagChoiceCount);const text=document.createElement('span');text.textContent='#'+tag;label.append(input,text);$('tagChoiceOptions').append(label);}
+ updateTagChoiceCount();$('tagChoiceDialog').showModal();return true;
+}
+function chosenTags(){return [...$('tagChoiceOptions').querySelectorAll('input:checked')].map(input=>input.value);}
+function updateTagChoiceCount(){
+ if(!tagChoiceTarget)return;
+ const count=chosenTags().length,maximum=tagChoiceTarget.maximum,extra=Math.max(0,count-maximum);
+ $('tagChoiceCount').textContent='已选择 '+count+' / '+maximum+' 个'+(extra?'，请取消 '+extra+' 个话题。':'，可以保存。');
+ $('tagChoiceCount').classList.toggle('limit-error',!!extra);$('tagChoiceApply').disabled=!!extra;
+}
+$('tagChoiceCancel').onclick=()=>{$('tagChoiceDialog').close();tagChoiceTarget=null;};
+$('tagChoiceDialog').addEventListener('close',()=>{tagChoiceTarget=null;});
+$('tagChoiceApply').onclick=()=>{
+ if(!tagChoiceTarget||busy||submitting||checking)return;
+ const {platform,maximum,original}=tagChoiceTarget,values=chosenTags();
+ if(values.length>maximum)return;
+ if(!selected().includes(platform)||JSON.stringify(fieldOverrides?.resolve(platform,'tags'))!==original){$('tagChoiceCount').textContent='平台选择或话题已变化，请关闭后重新打开。';$('tagChoiceApply').disabled=true;return;}
+ fieldOverrides.setField(platform,'tags',values);$('tagChoiceDialog').close();tagChoiceTarget=null;notice((platformNames[platform]||platform)+'独立话题已保存，正在重新检查素材。');
+};
+function scheduleTextCheck(){textCheckSequence++;clearTimeout(textCheckTimer);textCheckTimer=setTimeout(updateTextCheck,180);}
+async function updateTextCheck(){
+ if(!token||!selected().length){textFeedback={};setTextIssues([]);$('titleLimit').textContent='';$('descriptionLimit').textContent='';fieldOverrides?.setFeedback({});return;}
+ const seq=++textCheckSequence;
+ try{
+  const c=await request('/api/text-check',{payload:payload(),platforms:selected(),browser:embedded?'embedded':'external'});if(seq!==textCheckSequence)return;
+  $('titleLimit').textContent=c.summaries.title;$('descriptionLimit').textContent=c.summaries.description;$('tagHint').textContent=c.summaries.tags;
+  textFeedback=c.feedback;fieldOverrides?.setFeedback(c.feedback);setTextIssues(c.errors);
+ }catch(e){if(seq===textCheckSequence){setTextIssues([]);$('textLimitIssues').textContent='限制检查暂未完成；点击上传按钮会先重新检查，检查通过后才上传。';}}
+}
+
+$('tagSuggest').onclick=()=>tagController.suggest($('description').value);
+let videoImportSequence=0;
+async function loadVideo(path,video=null){const sequence=++videoImportSequence;notice('');$('videoDrop').classList.add('importing');$('videoDrop').setAttribute('aria-busy','true');try{const data=await request('/api/load',{path,video});if(sequence!==videoImportSequence)return;renderMaterial(data);dirty();}catch(e){if(sequence===videoImportSequence)throw e;}finally{if(sequence===videoImportSequence){$('videoDrop').classList.remove('importing');$('videoDrop').setAttribute('aria-busy','false');}}}
+function setCover(role,path,options={}){const key={common:'cover',landscape:'cover_landscape',portrait:'cover_portrait'}[role];if(!key)return;material[key]=path;material.cover_frames={...material.cover_frames};if(options.frame)material.cover_frames[role]=options.frame;else delete material.cover_frames[role];if(role==='common')material.cover_generated=!!options.generated;delete material.cover_generation_error;if(role==='landscape')$('coverLandscape').value=path;if(role==='portrait')$('coverPortrait').value=path;renderCover();dirty();}
+const materialEditor=window.MaterialEditor.mount({request,notice,dirty,getMaterial:()=>payload(),loadVideo,setCover,pick:kind=>window.draftDesktop?window.draftDesktop.choose(kind):window.webkit?.messageHandlers?.nativePicker?nativePick(kind):Promise.reject(new Error('请在 App 中选择文件，或拖入文字文件。'))});
+window.addEventListener('focus',refresh);document.addEventListener('visibilitychange',()=>{if(!document.hidden)refresh();});refresh();setInterval(refresh,1500);
+</script></body></html>

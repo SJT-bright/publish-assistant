@@ -1,0 +1,109 @@
+name: Windows native build and validation
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: Upload tested packages to the draft Release
+        type: boolean
+        default: false
+      tag:
+        description: Exact draft release tag
+        default: v1.6.1
+permissions:
+  contents: write
+jobs:
+  media:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cross compiler
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 make nasm
+      - name: Build static LGPL media tools
+        run: scripts/build_media.sh windows build/media
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-media-tools
+          path: build/media/tools
+  windows:
+    needs: media
+    runs-on: windows-latest
+    env:
+      SAU_MEDIA_TOOLS: ${{ github.workspace }}/build/media/tools
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26'
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-media-tools
+          path: build/media/tools
+      - name: Install fixed dependencies
+        run: |
+          python -m pip install -r requirements-build.txt
+          npm ci --prefix desktop --no-audit --no-fund
+      - name: Validate shared and native helpers
+        run: |
+          node --test tests/*.test.cjs tests/test_backend_health.cjs
+          python -m unittest tests.test_runtime_support tests.test_platform_limits tests.test_workbench_progress tests.test_fine_progress tests.test_media_preview tests.test_frame_capture
+      - name: Build self-contained application
+        run: |
+          python desktop/build_backend.py
+          node desktop/build.cjs
+      - name: Test actual Windows application
+        env:
+          PYTHONUTF8: '1'
+        run: python tests/test_packaged_app.py --app "dist/发布助手-win32-x64" --output "release-assets/Windows-validation.json"
+      - name: Package installer and portable ZIP
+        shell: pwsh
+        run: |
+          Push-Location desktop
+          npx electron-builder --prepackaged "../dist/发布助手-win32-x64" --win nsis --x64 --publish never
+          Pop-Location
+          7z a "release-assets/Publish-Assistant-1.6.1-Windows-x64.zip" "dist/发布助手-win32-x64/*"
+          python scripts/release_checksums.py
+      - name: Validate installed Windows application
+        shell: pwsh
+        run: |
+          $installer = Resolve-Path "release-assets/Publish-Assistant-1.6.1-Windows-x64-Setup.exe"
+          $destination = Join-Path $env:RUNNER_TEMP 'PublishAssistant-Installed'
+          $process = Start-Process -FilePath $installer -ArgumentList @('/S',"/D=$destination") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Installer failed' }
+          python tests/test_packaged_app.py --app "$destination" --output "release-assets/Windows-installer-validation.json"
+          if ($LASTEXITCODE) { throw 'Installed application failed validation' }
+          python scripts/release_checksums.py
+      - name: Store tested packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            release-assets/*.exe
+            release-assets/*.zip
+            release-assets/*validation.json
+            release-assets/SHA256SUMS-Windows.txt
+      - name: Upload validated assets to draft release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.upload }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $release = gh release view $env:RELEASE_TAG --json isDraft,targetCommitish | ConvertFrom-Json
+          if (-not $release.isDraft -or $env:RELEASE_TAG -ne 'v1.6.1') { throw 'Exact draft Release required' }
+          $assets = Get-ChildItem release-assets -File | Where-Object { $_.Extension -in '.exe','.zip' -or $_.Name -match 'validation.json|SHA256SUMS-Windows.txt' }
+          gh release upload $env:RELEASE_TAG @($assets.FullName)
+          if ($LASTEXITCODE) { throw 'Upload failed' }
+          New-Item -ItemType Directory -Path build/release-download -Force | Out-Null
+          gh release download $env:RELEASE_TAG --pattern '*Windows*' --dir build/release-download
+          if ($LASTEXITCODE) { throw 'Release download failed' }
+          foreach ($asset in $assets) {
+            $copy = Join-Path build/release-download $asset.Name
+            if (-not (Test-Path $copy)) { throw 'Missing downloaded asset' }
+            if ((Get-FileHash $asset.FullName).Hash -ne (Get-FileHash $copy).Hash) { throw 'Release checksum mismatch' }
+          }

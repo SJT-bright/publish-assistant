@@ -1,0 +1,14 @@
+[
+  {
+    "file": "ffmpeg-9.0.1.tar.xz",
+    "url": "https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz",
+    "sha256": "cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635",
+    "bytes": 12036420
+  },
+  {
+    "file": "zlib-1.3.2.tar.xz",
+    "url": "https://zlib.net/zlib-1.3.2.tar.xz",
+    "sha256": "d7a0654783a4da529d1bb793b7ad9c3318020af77667bcae35f95d0e42a792f3",
+    "bytes": 1320064
+  }
+]

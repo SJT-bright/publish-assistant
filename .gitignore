@@ -1,0 +1,15 @@
+.venv/
+.release-venv/
+node_modules/
+__pycache__/
+*.pyc
+*.spec
+*.log
+.DS_Store
+build/
+dist/
+.draft-workbench/
+cookies/
+cookiesFile/
+.env
+release-assets/
