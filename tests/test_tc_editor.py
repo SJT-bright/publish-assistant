@@ -4,9 +4,11 @@ Existing handlers throw if invoked; mediaList/disablePostTip and private
 getters also throw. Native File identity is exercised in real browser realms.
 """
 import unittest
+import os
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from patchright.async_api import async_playwright
 
@@ -52,8 +54,14 @@ window.makeMaterial=statuses=>{
 
 class TcMaterialSourceTests(unittest.TestCase):
     def test_fixture_contract_matches_current_official_cached_component(self):
-        source=(Path(__file__).resolve().parents[1]/
-                'research/raw/2026-10-03/limits-login/tc-content-841.d575b04c.js').read_text()
+        cached=Path(os.environ.get('SAU_TC_CACHED_COMPONENT',Path(__file__).resolve().parents[1]/
+                'research/raw/2026-10-03/limits-login/tc-content-841.d575b04c.js'))
+        if not cached.is_file():
+            self.skipTest('Private official source cache is optional; set SAU_TC_CACHED_COMPONENT to verify it.')
+        content=cached.read_bytes()
+        self.assertEqual(hashlib.sha256(content).hexdigest(),
+                         '022cd6da6b8f3afed8aded29b19aed5c360ea504784cd69c969c6e3578d7198b')
+        source=content.decode()
         for contract in ('"fileList",[]', '{key:"handleSetFileList",value:function(e){this.fileList=e}',
                          '{key:"handleDeleteFile",value:function(e)', '{key:"handleFileListChange",value:function(e)',
                          '{key:"updateVideo",value:function(e){this.$emit("updateFile",{file:this.value[0],parcials:e})}',
@@ -104,8 +112,8 @@ class TcMaterialBrowserTests(unittest.IsolatedAsyncioTestCase):
                     done_count=done,all_uploaded=uploaded,all_cover_cropped=cropped,can_save_draft=save))
                 self.assertTrue(all(type(value) in (bool,int) for value in result.values()))
                 await self.assert_read_only()
-        # Official canSaveDraft does not test cover readiness; the caller must
-        # retain its separate all_cover_cropped gate before accepting a video.
+        # Official canSaveDraft and upload completion do not test automatic
+        # cover readiness. Custom covers wait for their own native edit controls.
         await self.page.evaluate("material.fileList[0].thumbUrl='';",isolated_context=False)
         result=await read_tc_material_state(self.page)
         self.assertTrue(result['all_uploaded'])
@@ -196,7 +204,9 @@ class TcMaterialAdapterTests(unittest.IsolatedAsyncioTestCase):
         locator=SimpleNamespace(all=AsyncMock(return_value=[native_input]),count=AsyncMock(return_value=1))
         frame=SimpleNamespace(locator=lambda _selector:locator)
         page=SimpleNamespace(frames=[frame],_sau_draft_evidence=SimpleNamespace(
-            capture_tc_cdn_snapshot=AsyncMock(return_value=True)))
+            capture_tc_cdn_snapshot=AsyncMock(return_value=True),
+            expected={'job_id':'fixture-job','receipt_nonce':'fixture-nonce'},
+            assets={'video':{'kind':'video','name':'fixture.mp4','size':1,'sha256':'a'*64}}))
         return page,native_input
 
     async def test_nonempty_or_unknown_materials_never_reach_native_file_selection(self):
@@ -205,29 +215,35 @@ class TcMaterialAdapterTests(unittest.IsolatedAsyncioTestCase):
                 page,native_input=self.page_with_one_video_input()
                 state={**UNKNOWN,'recognized':recognized,'count':count,'video_count':count}
                 reader=AsyncMock(return_value=state)
+                stage=SimpleNamespace(path=Path('fixture-stage.mp4'),assert_current=Mock())
                 with patch('uploader.tc_editor.read_tc_material_state',reader), \
                      patch('uploader.draft_only.assert_draft_safe',new=AsyncMock()), \
+                     patch('uploader.tc_pipeline.capture_tc_upload',new=AsyncMock(return_value=SimpleNamespace())), \
+                     patch('uploader.tc_stage.create_tc_native_stage',new=AsyncMock(return_value=stage)) as prepare, \
                      patch('uploader.tencent_uploader.main.set_local_files',new=AsyncMock()) as files:
                     if case=='empty':
                         await self.uploader().upload_video_file(page,'fixture.mp4')
-                        files.assert_awaited_once_with(page,native_input,'fixture.mp4')
+                        files.assert_awaited_once_with(page,native_input,stage.path)
+                        prepare.assert_awaited_once_with('fixture.mp4',page._sau_draft_evidence.assets['video'],
+                            recovery_root=None,scope={'job_id':'fixture-job','receipt_nonce':'fixture-nonce'})
+                        self.assertEqual(stage.assert_current.call_count,2)
                     else:
                         with self.assertRaisesRegex(RuntimeError,'尚未确认|已有素材'):
                             await self.uploader().upload_video_file(page,'fixture.mp4')
                         files.assert_not_awaited()
+                        prepare.assert_not_awaited()
                     reader.assert_awaited_once_with(page)
 
-    async def test_upload_wait_requires_single_done_and_completed_cover(self):
+    async def test_upload_wait_requires_single_done_without_waiting_for_automatic_cover(self):
         pending={**UNKNOWN,'recognized':True,'count':1,'video_count':1}
         no_cover={**pending,'done_count':1,'all_uploaded':True,'can_save_draft':True}
-        ready={**no_cover,'all_cover_cropped':True}
         page=object()
-        reader=AsyncMock(side_effect=[UNKNOWN,pending,no_cover,ready])
+        reader=AsyncMock(side_effect=[UNKNOWN,pending,no_cover])
         with patch('uploader.tc_editor.read_tc_material_state',reader), \
              patch('uploader.draft_only.assert_draft_safe',new=AsyncMock()), \
              patch('uploader.tencent_uploader.main.set_local_files',new=AsyncMock()) as files:
             await self.uploader().wait_for_upload_complete(page)
-            self.assertEqual(reader.await_count,4)
+            self.assertEqual(reader.await_count,3)
             files.assert_not_awaited()
 
     async def test_upload_wait_rejects_duplicate_materials_without_reimport(self):

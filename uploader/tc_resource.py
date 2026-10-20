@@ -36,6 +36,13 @@ an opaque server value: all eight observed copies had the same non-empty,
 three-digit ASCII value, while the official client has no literal query key or
 value allowlist for it. Require a non-empty visible-ASCII value and hash its
 exact decoded contents; do not guess an enum.
+
+On 2026-10-15, the normal post_draft request from a fresh native upload had
+thumbUrl/coverUrl/fullCoverUrl/shareCoverUrl at /251/20304/stodownload with
+exact non-auth keys bizid,dotrans,encfilekey,hy,idx,m,scene,uzid, without
+picformat. This native-upload image family has its own path-sensitive identity;
+it is not the processed picformat image family or the 20302 video family.
+All non-auth values remain opaque, including the present-but-empty m field.
 """
 
 import hashlib
@@ -51,20 +58,26 @@ _ORIGINS = {
 _PATHS = {
     'encrypted': '/251/20302/stodownload',
     'filekey': '/251/20304/stodownload',
+    'encrypted_scene': '/251/20302/stodownload',
     'image_cover': '/251/20304/stodownload',
     'image_thumbnail': '/251/20304/stodownload',
+    'native_uploaded_image': '/251/20304/stodownload',
 }
 _AUTH = frozenset({'token', 'sign', 'findertoken'})
 _ENCRYPTED_REQUIRED = frozenset({'encfilekey', 'm', 'uzid', 'bizid', 'hy', 'idx'})
 _ENCRYPTED_OPTIONAL = frozenset({'scene', 'dotrans', 'basedata'})
+# Exact observed normal processed-preview family. It has its own identity;
+# changing encfilekey/uzid/basedata never aliases another server read.
+_ENCRYPTED_SCENE_REQUIRED = frozenset({'encfilekey', 'm', 'uzid', 'hy', 'idx', 'scene', 'basedata'})
 _IMAGE_COMMON = frozenset({'encfilekey', 'm', 'uzid', 'hy', 'idx', 'picformat'})
 _IMAGE_COVER_REQUIRED = _IMAGE_COMMON | {'scene'}
 _IMAGE_THUMBNAIL_REQUIRED = _IMAGE_COMMON | {'bizid', 'dotrans'}
+_NATIVE_UPLOADED_IMAGE_REQUIRED = _ENCRYPTED_REQUIRED | {'dotrans', 'scene'}
 _PLAIN_REQUIRED = frozenset({'filekey', 'm', 'storeid', 'bizid', 'hy'})
 _PLAIN_OPTIONAL = frozenset({'dotrans', 'adaptivelytrans'})
 _ALL_KEYS = (_AUTH | _ENCRYPTED_REQUIRED | _ENCRYPTED_OPTIONAL | _IMAGE_COMMON |
              _IMAGE_COVER_REQUIRED | _IMAGE_THUMBNAIL_REQUIRED |
-             _PLAIN_REQUIRED | _PLAIN_OPTIONAL)
+             _PLAIN_REQUIRED | _PLAIN_OPTIONAL | _ENCRYPTED_SCENE_REQUIRED)
 _BAD_ESCAPE = re.compile(r'%(?![0-9a-fA-F]{2})')
 
 
@@ -120,8 +133,12 @@ def tc_resource_identity(url):
         return None
     public = {key: value for key, value in fields.items() if key not in _AUTH}
     names = set(public)
-    if _ENCRYPTED_REQUIRED <= names <= _ENCRYPTED_REQUIRED | _ENCRYPTED_OPTIONAL:
+    if parsed.path == _PATHS['native_uploaded_image'] and names == _NATIVE_UPLOADED_IMAGE_REQUIRED:
+        family = 'native_uploaded_image'
+    elif _ENCRYPTED_REQUIRED <= names <= _ENCRYPTED_REQUIRED | _ENCRYPTED_OPTIONAL:
         family = 'encrypted'
+    elif names == _ENCRYPTED_SCENE_REQUIRED:
+        family = 'encrypted_scene'
     elif names == _IMAGE_COVER_REQUIRED:
         family = 'image_cover'
     elif names == _IMAGE_THUMBNAIL_REQUIRED:

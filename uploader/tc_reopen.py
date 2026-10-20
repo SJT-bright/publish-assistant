@@ -8,7 +8,10 @@ No URL, API call, Vue business method, or synthetic DOM click is generated.
 from __future__ import annotations
 
 import asyncio
+import copy
+import inspect
 import json
+import math
 import time
 from urllib.parse import urlsplit
 
@@ -285,6 +288,273 @@ async def _hover(control):
             pass
 
 
+async def _processing_account_verdict(session, expected):
+    """Keep inspect_session's explicit bootstrap/logout distinction locally.
+
+    DraftEvidenceSession.read_account intentionally projects four identity
+    fields. During a normal page reload that projection loses the distinction
+    between inspect_session's pending owner and visible login/logout/risk.
+    Read the same trusted reader here; no old identity authorizes advancing.
+    """
+    try:
+        reader = getattr(session, 'account_reader', None)
+        if callable(reader):
+            value = reader() if len(inspect.signature(reader).parameters) == 0 else reader(session.page, session.platform)
+            raw = await asyncio.wait_for(value, 5) if inspect.isawaitable(value) else value
+        else:
+            raw = await asyncio.wait_for(session.read_account(), 5)
+    except asyncio.TimeoutError:
+        return 'rejected', 'account_reader_timeout'
+    except Exception as error:
+        reason = 'account_risk_rejected' if getattr(error, 'status', None) == 'risk_paused' else 'account_reader_failed'
+        return 'rejected', reason
+    if not isinstance(raw, dict):
+        return 'rejected', 'account_result_invalid'
+    if raw.get('account_conflict') is True:
+        return 'changed', 'account_identity_changed'
+    if raw.get('status') == 'risk_paused' or raw.get('diagnostic') in ('visible_login_marker', 'login_route', 'owner_logged_out', 'response_rejected', 'owner_not_unique', 'owner_response_invalid'):
+        return 'rejected', 'account_not_verified'
+    identity = {k: raw[k] for k in ('verified', 'identity', 'uid', 'platform') if k in raw}
+    if identity == expected:
+        return 'same', 'account_verified_same'
+    if (raw.get('account_conflict') is True or raw.get('verified') is True or
+            any(raw.get(k) is not None and raw[k] != expected.get(k) for k in ('uid', 'identity', 'platform'))):
+        return 'changed', 'account_identity_changed'
+    # Exact existing inspect_session contract: no owner yet, not a visible
+    # login, invalid response, logout, risk pause or ambiguous owner. The
+    # caller permits only a finite wait in the normal creator-list document.
+    if (expected.get('verified') is True and raw.get('verified') is False and
+            raw.get('platform') == 'tencent' and raw.get('status') == 'needs_reauthentication' and
+            raw.get('reason') == '创作者身份尚未确认' and raw.get('account_conflict') is False and
+            not raw.get('diagnostic') and not raw.get('uid') and not raw.get('identity')):
+        return 'pending', 'account_initializing'
+    return 'rejected', 'account_not_verified'
+
+
+def _processing_read_budget(session):
+    configured = getattr(session, 'tc_processing_read_timeout', None)
+    value = float(configured if configured is not None else 90)
+    if not math.isfinite(value):
+        raise ValueError('Invalid TC processing wait budget')
+    return min(900, max(.01, value)), configured is not None
+
+
+def _processing_frozen_proof(session, candidate):
+    from uploader.tc_processing import TCProcessingObserver
+    observer = getattr(session, 'tc_processing_observer', None)
+    frozen = getattr(observer, '_frozen_reopen', None)
+    try:
+        if (type(observer) is TCProcessingObserver and isinstance(frozen, dict) and
+                frozen.get('candidate') == candidate and observer._frozen_events_current()):
+            return observer, frozen
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _reopen_time_budget(session, candidate):
+    budget, explicit = _processing_read_budget(session)
+    # This is the enclosing ceiling. The inner wait grants 900 only after
+    # normal same-ID handleStatus=1; unknown/missing rows still get 90.
+    if not explicit and _processing_frozen_proof(session, candidate):
+        budget = 900
+    settle = min(15, max(.01, float(getattr(session, 'tc_account_reload_timeout', 8))))
+    return 35 + settle + budget
+
+
+async def wait_tc_processing_list(page, candidate, session, fields, edit):
+    """Normal list reloads; wait for current identity, never inherit old auth."""
+    if not hasattr(session, 'reads'):
+        return edit  # Ordinary UI-only fixtures have no network observer.
+    timeout, explicit_timeout = _processing_read_budget(session)
+    interval = min(15, max(.05, float(getattr(session, 'tc_processing_reload_interval', 5))))
+    account_timeout = min(15, max(.01, float(getattr(session, 'tc_account_reload_timeout', 8))))
+    started = time.monotonic()
+    deadline, next_reload = started + timeout, started + interval
+    account_deadline = min(deadline, time.monotonic() + account_timeout)
+    expected_account = copy.deepcopy(session.account)
+    expected_task = copy.deepcopy(getattr(session, 'expected', None))
+    last_account = None
+    row_deadline = None
+    list_mount_deadline = None
+    reload_after = reload_response_deadline = None
+    read_floor = session.reopen_at
+    response_timeout = min(30, max(.01, float(getattr(session, 'tc_list_response_timeout', 20))))
+    row_timeout = min(12, max(.01, float(getattr(session, 'tc_row_mount_timeout', 12))))
+    proof = _processing_frozen_proof(session, candidate)
+    frozen_snapshot = copy.deepcopy(proof[1]) if proof else None
+    extended = False
+    from uploader.tc_processing import TCProcessingObserver
+    original_observer = getattr(session, 'tc_processing_observer', None)
+    invalid_frozen = (type(original_observer) is TCProcessingObserver and
+        getattr(original_observer, '_frozen_reopen', None) is not None and proof is None)
+
+    def frozen_changed():
+        if proof is None:
+            return False
+        current = _processing_frozen_proof(session, candidate)
+        return (current is None or current[0] is not proof[0] or current[1] is not proof[1] or
+                current[1] != frozen_snapshot)
+
+    async def dispose(control):
+        if control is not None:
+            try:
+                await asyncio.wait_for(control.dispose(), 1)
+            except Exception:
+                pass
+
+    def scope_error():
+        if getattr(page, '_sau_draft_evidence', None) is not session or session.closed:
+            return 'session_changed_or_closed'
+        if session.issues:
+            return 'session_issues_present'
+        if session.account != expected_account:
+            return 'bound_account_changed'
+        if getattr(session, 'expected', None) != expected_task:
+            return 'processing_expected_changed'
+        if invalid_frozen or frozen_changed():
+            return 'processing_frozen_proof_changed'
+        frame = getattr(page, 'main_frame', None)
+        if (not _platform_url(page.url) or frame is not None and not _platform_url(frame.url) or
+                urlsplit(page.url).path == '/platform/post/create'):
+            return 'normal_list_scope_unavailable'
+        return None
+
+    try:
+        while time.monotonic() < deadline:
+            reason = scope_error()
+            if reason:
+                _diagnostic('processing_wait', reason, issue_count=len(session.issues))
+                return None
+            verdict, reason = await _processing_account_verdict(session, expected_account)
+            changed = scope_error()
+            if changed:
+                _diagnostic('processing_wait', changed, issue_count=len(session.issues))
+                return None
+            if verdict != last_account:
+                _diagnostic('processing_wait', reason)
+                if verdict == 'pending':
+                    from uploader.draft_progress import emit as emit_progress
+                    emit_progress('verify', 'running', detail='草稿已保存，列表重新加载后正在确认当前账号')
+                last_account = verdict
+            if verdict == 'pending':
+                await dispose(edit); edit = None
+                if time.monotonic() >= account_deadline:
+                    _diagnostic('processing_wait', 'account_initialization_deadline_expired')
+                    return None
+                await asyncio.sleep(.1)
+                continue
+            if verdict != 'same':
+                return None
+            await session.drain()
+            changed = scope_error()
+            if changed:
+                _diagnostic('processing_wait', changed, issue_count=len(session.issues))
+                return None
+            rows = [x for x in session.reads if x.get('id') == candidate['id'] and x.get('owner') == candidate['owner'] and
+                    x.get('tc_normal_read') == 'get_draft_list' and x.get('request_method') == 'POST' and
+                    all(type(x.get(k)) in (int, float) and math.isfinite(x[k]) for k in ('request_at', 'observed_at')) and
+                    read_floor <= x['request_at'] <= x['observed_at'] <= time.time()]
+            if reload_after is not None:
+                # drain() cannot wait for a POST whose response headers have
+                # not arrived yet. Only this reload's normal same-row read
+                # releases the barrier; a late read from an older request does not.
+                current_reads = [x for x in rows if x['request_at'] >= reload_after]
+                if not current_reads:
+                    state, current = await _lookup(page, 'row', candidate, fields)
+                    unexpected_control = state == 'none' and current is not None
+                    await dispose(current)
+                    current_fields, unused = await _lookup(page, 'fields', candidate, fields)
+                    await dispose(unused)
+                    if scope_error() or state not in ('unique', 'none') or unexpected_control or current_fields != 'none':
+                        _diagnostic('processing_wait', scope_error() or 'normal_list_scope_unavailable')
+                        return None
+                    if time.monotonic() >= reload_response_deadline:
+                        _diagnostic('processing_wait', 'normal_list_response_deadline_expired')
+                        return None
+                    await asyncio.sleep(.1)
+                    continue
+                reload_after = reload_response_deadline = None
+                next_reload = time.monotonic() + interval
+            row = max(rows, key=lambda x: (x['request_at'], x['observed_at'])) if rows else None
+            status = row.get('tc_handle_status') if row else None
+            if type(status) is int and status == 1 and not explicit_timeout and proof is not None:
+                from uploader.draft_evidence import field_match
+                if field_match('tencent', row, session.expected):
+                    deadline = started + 900
+                    if not extended:
+                        extended = True
+                        _diagnostic('processing_wait', 'saved_platform_processing', max_wait_seconds=900)
+                        from uploader.draft_progress import emit as emit_progress
+                        emit_progress('verify', 'running', detail='保存已完成，平台正在加工本次视频，等待草稿可重开核验，最多15分钟')
+            if type(status) is int and status == 2:
+                if edit is None:
+                    state, edit = await _lookup(page, 'row', candidate, fields)
+                    if state == 'none' and edit is None:
+                        if row_deadline is None:
+                            row_deadline = min(deadline, time.monotonic() + row_timeout)
+                            _diagnostic('processing_wait', 'successful_row_mount_pending')
+                            from uploader.draft_progress import emit as emit_progress
+                            emit_progress('verify', 'running', detail='平台已处理完成，正在加载本次草稿的编辑入口')
+                        if time.monotonic() >= row_deadline:
+                            _diagnostic('processing_wait', 'successful_row_mount_deadline_expired')
+                            return None
+                        await asyncio.sleep(.1)
+                        continue
+                    if state != 'unique' or edit is None:
+                        _diagnostic('processing_wait', 'successful_row_control_unavailable', verdict=state)
+                        return None
+                final, reason = await _processing_account_verdict(session, expected_account)
+                if scope_error() or final != 'same':
+                    _diagnostic('processing_wait', scope_error() or reason)
+                    return None
+                current, edit = edit, None
+                return current
+            row_deadline = None
+            if status in (3, 4, 5):
+                _diagnostic('processing_wait', 'server_processing_failed', handle_status=status)
+                return None
+            await dispose(edit); edit = None
+            if time.monotonic() >= next_reload:
+                state, current = await _lookup(page, 'row', candidate, fields)
+                unexpected_control = state == 'none' and current is not None
+                await dispose(current)
+                current_fields, unused = await _lookup(page, 'fields', candidate, fields)
+                await dispose(unused)
+                if scope_error() or state not in ('unique', 'none') or unexpected_control or current_fields != 'none':
+                    _diagnostic('processing_wait', scope_error() or 'normal_list_scope_unavailable')
+                    return None
+                if state == 'none':
+                    # The normal POST may outlast the five-second reload cadence.
+                    # Wait for its row before considering another reload; do not
+                    # treat an empty mounting list as a different record.
+                    if list_mount_deadline is None:
+                        list_mount_deadline = min(deadline, time.monotonic() + row_timeout)
+                        _diagnostic('processing_wait', 'normal_row_mount_pending')
+                        from uploader.draft_progress import emit as emit_progress
+                        emit_progress('verify', 'running', detail='平台草稿列表仍在加载，正在等待本次记录显示')
+                    if time.monotonic() >= list_mount_deadline:
+                        _diagnostic('processing_wait', 'normal_row_mount_deadline_expired')
+                        return None
+                    await asyncio.sleep(.1)
+                    continue
+                list_mount_deadline = None
+                _diagnostic('processing_wait', 'normal_list_reload', handle_status=status if status in (1, 2, 3, 4, 5) else None)
+                from uploader.draft_progress import emit as emit_progress
+                emit_progress('verify', 'running', detail='草稿已保存，等待平台完成媒体处理，正在重新读取草稿列表')
+                reload_after = read_floor = time.time()
+                await page.reload(wait_until='domcontentloaded', timeout=20000)
+                reload_response_deadline = min(deadline, time.monotonic() + response_timeout)
+                next_reload = time.monotonic() + interval
+                account_deadline = min(deadline, time.monotonic() + account_timeout)
+                last_account = None
+            await asyncio.sleep(.05)
+        _diagnostic('processing_wait', 'processing_deadline_expired')
+        return None
+    finally:
+        await dispose(edit)
+
+
 async def reopen_tc_draft(page, candidate) -> bool:
     """Click the unique exact-ID draft's edit operation and attest UI binding.
 
@@ -307,7 +577,7 @@ async def reopen_tc_draft(page, candidate) -> bool:
     _diagnostic('entry', 'fresh_saved_record_attested')
     stage = 'initial_lookup'
     try:
-        async with asyncio.timeout(35):
+        async with asyncio.timeout(_reopen_time_budget(session, candidate)):
             unchanged, _ = await _lookup(page, 'fields', candidate, fields)
             state, edit = await _lookup(page, 'row', candidate, fields)
             _diagnostic('initial_lookup', 'verdicts', fields=unchanged, row=state)
@@ -364,6 +634,10 @@ async def reopen_tc_draft(page, candidate) -> bool:
             if state != 'unique' or edit is None:
                 return _failed('saved_row_lookup', 'unique_control_unavailable', verdict=state,
                                has_control=edit is not None)
+            stage = 'processing_list_wait'
+            edit = await wait_tc_processing_list(page, candidate, session, fields, edit)
+            if edit is None:
+                return _failed(stage, 'successful_normal_read_unavailable')
             stage = 'saved_row_click'
             if not await _click(edit, candidate):
                 return False

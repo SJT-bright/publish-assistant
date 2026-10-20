@@ -165,7 +165,7 @@ async def run(app, output, click_probe_only=False, probe_driver='playwright'):
     base = f'http://127.0.0.1:{service.server_port}'
     checks, errors = {}, []
     output.parent.mkdir(parents=True, exist_ok=True)
-    source_files = [ROOT/'desktop'/name for name in ['main.cjs', 'backend-health.cjs', 'native-view-paint.cjs', 'preload.cjs', 'platform-preload.cjs', 'shell.html', 'shell.js']]
+    source_files = [ROOT/'desktop'/name for name in ['main.cjs', 'backend-health.cjs', 'native-view-paint.cjs', 'page-operations.cjs', 'preload.cjs', 'platform-preload.cjs', 'shell.html', 'shell.js']]
     source_files.append(ROOT/'ui-assets/glass.css')
     if app:
         source_files = [app/'Contents/Resources/app.asar']
@@ -181,7 +181,7 @@ async def run(app, output, click_probe_only=False, probe_driver='playwright'):
             source_root = folder/'source'
             source = source_root/'desktop'
             source.mkdir(parents=True)
-            for name in ['main.cjs', 'backend-health.cjs', 'native-view-paint.cjs', 'preload.cjs', 'platform-preload.cjs', 'shell.html', 'shell.js', 'package.json']:
+            for name in ['main.cjs', 'backend-health.cjs', 'native-view-paint.cjs', 'page-operations.cjs', 'preload.cjs', 'platform-preload.cjs', 'shell.html', 'shell.js', 'package.json']:
                 shutil.copy2(ROOT/'desktop'/name, source/name)
             shutil.copytree(ROOT/'ui-assets', source_root/'ui-assets')
             shutil.copytree(ROOT/'ui-assets', source/'ui-assets')

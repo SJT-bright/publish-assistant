@@ -241,10 +241,12 @@ class XiaohongshuUploaderTests(unittest.TestCase):
         )
         self.assertIn(("type", "描述内容", None), page.keyboard.actions)
         self.assertIn(("type", "#话题1", 30), page.keyboard.actions)
-        self.assertEqual(
-            page.locators['#creator-editor-topic-container .item'].actions,
-            [("wait_for", {"state": "visible", "timeout": 2000}), ("click",)],
-        )
+        topic_actions = page.locators['#creator-editor-topic-container .item'].actions
+        self.assertEqual(topic_actions[0][0], "wait_for")
+        self.assertEqual(topic_actions[0][1]["state"], "visible")
+        self.assertGreater(topic_actions[0][1]["timeout"], 0)
+        self.assertLessEqual(topic_actions[0][1]["timeout"], 10000)
+        self.assertEqual(topic_actions[1:], [("click",)])
 
     def test_video_fill_meta_can_fill_first_tag_without_desc(self):
         app = xhs_main.XiaoHongShuVideo(

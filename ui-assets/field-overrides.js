@@ -223,6 +223,7 @@
       setField(platform, field, value) { store.setField(platform, field, value); notify(platform, field); },
       unsetField(platform, field) { store.unsetField(platform, field); notify(platform, field); },
       refresh,
+      close() { for (const widget of widgets.values()) widget.close(); },
       open(field, platform) {
         const widget = widgets.get(field);
         if (!widget) return;

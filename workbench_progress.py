@@ -30,6 +30,9 @@ DETAILS |= frozenset(label + suffix for label in _EMITTER_LABELS
                      for suffix in ('', '已完成', '未完成，已保留现场'))
 DETAILS |= {'未提供自定义封面，使用平台默认封面', '此步骤不适用'}
 STATUS_MESSAGES = {
+    'published_submission_verified': '投稿已提交，等待平台审核',
+    'published_unverified': '已尝试投稿，回执待确认；不会自动再次提交',
+    'publication_blocked': '提交前核验未通过，页面已保留',
     'pending': '等待执行', 'running': '正在处理当前平台',
     'login_verified': '登录已在现场验证',
     'local_draft_verified': '本地草稿已重开核验，保存在当前浏览器',
@@ -127,6 +130,9 @@ def public_progress(value):
     operations = public_operations(value.get('operations'))
     if operations:
         result['operations'] = operations
+    active = value.get('active_stages')
+    if isinstance(active, list) and len(active) > 1:
+        result['active_stages'] = [stage for stage in STAGES if stage in active]
     return result
 
 
@@ -144,9 +150,17 @@ def apply_progress(item, event, now):
     skipped = previous['skipped'][:] if previous else []
     if stage in completed + skipped:
         return False
-    if previous and previous['stage'] == stage and previous['state'] == 'failed':
+    if previous and previous['state'] == 'failed':
         return False
     operations = public_operations(previous.get('operations')) if previous else {}
+    raw = item.get('progress', {})
+    stored_activity = raw.get('stage_activity', {})
+    if not isinstance(stored_activity, dict): stored_activity = {}
+    activity = {key: value for key, value in stored_activity.items()
+                if key in STAGES and isinstance(value, dict) and value.get('state') == 'running'
+                and _timestamp(value.get('started_at')) is not None}
+    if not activity and previous and previous['state'] == 'running':
+        activity[previous['stage']] = {'state': 'running', 'started_at': previous['started_at']}
     if 'plan' in event:
         if stage in operations and operations[stage]['plan'] != event['plan']:
             return False
@@ -169,29 +183,44 @@ def apply_progress(item, event, now):
         if op_state in ('completed', 'skipped'):
             row[op_state].append(name)
             row.pop('percent', None)
-    started = previous['started_at'] if previous and previous['stage'] == stage else now
+    started = activity.get(stage, {}).get('started_at', previous['started_at'] if previous and previous['stage'] == stage else now)
+    if state == 'running':
+        activity[stage] = {'state': 'running', 'started_at': started}
+    else:
+        activity.pop(stage, None)
     if state == 'completed':
         completed.append(stage)
     elif state == 'skipped':
         skipped.append(stage)
-    item['progress'] = {'stage': stage, 'label': LABELS[stage], 'state': state,
-                        'started_at': started, 'updated_at': now,
+    foreground = max(activity, key=STAGES.index) if activity and state != 'failed' else stage
+    foreground_state = 'running' if foreground in activity else state
+    foreground_started = activity[foreground]['started_at'] if foreground in activity else started
+    item['progress'] = {'stage': foreground, 'label': LABELS[foreground], 'state': foreground_state,
+                        'started_at': foreground_started, 'updated_at': now,
                         'completed': _stage_list(completed), 'skipped': _stage_list(skipped)}
+    if activity:
+        item['progress']['stage_activity'] = activity
+    if len(activity) > 1:
+        item['progress']['active_stages'] = [key for key in STAGES if key in activity]
     if operations:
         item['progress']['operations'] = operations
-    if event.get('detail'):
+    if event.get('detail') and foreground == stage:
         item['progress']['detail'] = event['detail']
+    elif previous and foreground == previous['stage'] and raw.get('detail') in DETAILS:
+        item['progress']['detail'] = raw['detail']
     return True
 
 
 def finish_progress(item, status, now):
     """Keep the last known phase visible when execution stops without proof."""
     state = {'cancelled': 'cancelled', 'failed': 'failed', 'result_unknown': 'unknown',
-             'saved_unverified': 'unverified', 'risk_paused': 'failed',
+             'saved_unverified': 'unverified', 'published_unverified': 'unverified',
+             'publication_blocked': 'failed', 'risk_paused': 'failed',
              'platform_restricted': 'failed', 'adapter_mismatch': 'failed',
              'needs_reauthentication': 'failed', 'account_mismatch': 'failed'}.get(status)
     progress = public_progress(item.get('progress'))
     if state is not None and progress is not None:
+        progress.pop('active_stages', None)
         progress.update(state=state, updated_at=now)
         item['progress'] = progress
 
@@ -220,7 +249,7 @@ def progress_summary(job, platforms):
     if not valid_job_id(job_id):
         job_id = None
     return {'available': True, 'job': {
-        'id': job_id, 'action': job.get('action') if job.get('action') in ('login', 'draft') else None,
+        'id': job_id, 'action': job.get('action') if job.get('action') in ('login', 'draft', 'publish') else None,
         'active': job.get('active') is True, 'platform': item['platform'],
         'platform_name': platforms[item['platform']], 'platform_index': index + 1,
         'platform_count': len(results), 'status': status, 'message': message, 'progress': progress}}

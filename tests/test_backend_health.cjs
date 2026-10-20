@@ -173,10 +173,10 @@ test('automatic recovery retries only transient failures, at most twice', async 
 function desktopFixture({backend, loads, flush} = {}) {
   const root = path.resolve(__dirname, '..'), handlers = new Map();
   const observed = {backends:0, bridges:0, loads:0, timers:0, descriptors:0, stops:0};
-  const app = {isPackaged:false, getPath:() => '/isolated-connection-profile', setPath:() => {}, setName:() => {},
+  const app = {isPackaged:false, getVersion:() => 'isolated-test', getPath:() => '/isolated-connection-profile', setPath:() => {}, setName:() => {},
     setAboutPanelOptions:() => {}, commandLine:{appendSwitch:() => {}}, requestSingleInstanceLock:() => false,
     quit:() => {}, on:() => {}};
-  const fakeFs = {...fs, mkdirSync:() => {}, writeFileSync:() => {observed.descriptors++;}};
+  const fakeFs = {...fs, mkdirSync:() => {}, promises:{mkdir:async()=>{}, writeFile:async()=>{observed.descriptors++;}, chmod:async()=>{}, rename:async()=>{}, unlink:async()=>{}}, writeFileSync:() => {observed.descriptors++;}};
   const fakeHttp = {createServer:() => {
     observed.bridges++;
     const server = new EventEmitter();

@@ -1,4 +1,4 @@
-const {app, BrowserWindow, WebContentsView, ipcMain, dialog, Menu, session, clipboard, ClipboardItem, nativeImage} = require('electron');
+const {app, BrowserWindow, WebContentsView, ipcMain, dialog, Menu, session, shell, net, clipboard, ClipboardItem, nativeImage} = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
@@ -6,9 +6,13 @@ const crypto = require('node:crypto');
 const {spawn} = require('node:child_process');
 const {createBackendManager, waitForDebuggingEndpoint, withTimeout, recoverConnection} = require(path.join(__dirname, 'backend-health.cjs'));
 const {recoverOfficialMigration}=require(path.join(__dirname,'platform-migration.cjs'));
+const {runPageOperation,notifyPageUnload}=require(path.join(__dirname,'page-operations.cjs'));
 const {canPublishManually,validatePublicationMode}=require(path.join(__dirname,'publication-mode.cjs'));
 const {createCoverClipboard}=require(path.join(__dirname,'cover-clipboard.cjs'));
 const {createNativeViewPainter} = require(path.join(__dirname, 'native-view-paint.cjs'));
+const {createPrivateIO} = require(path.join(__dirname, 'private-io.cjs'));
+const {REPOSITORY_URL,createGitHubUpdater} = require(path.join(__dirname,'github-updater.cjs'));
+const {prepareInstallation} = require(path.join(__dirname,'update-installer.cjs'));
 
 const config = app.isPackaged ? require(path.join(__dirname, 'runtime.json')) : {root: path.resolve(__dirname, '..')};
 const {resolveRuntime} = require(path.join(__dirname,'runtime-paths.cjs'));
@@ -37,7 +41,6 @@ function assertIsolatedCandidate() {
 assertIsolatedCandidate();
 const privateDir = runtime.privateDir;
 const descriptor = path.join(privateDir, 'embedded-browser.json');
-const sessionStatusFile = path.join(privateDir, 'embedded-session-status.json');
 const progressModel = require(path.join(app.isPackaged ? __dirname : root, 'ui-assets/progress-model.js'));
 const ownerStateScript = fs.readFileSync(path.join(app.isPackaged ? __dirname : root, 'ui-assets/session-owner.js'), 'utf8').trim();
 const backendPort = Number(process.env.SAU_WORKBENCH_PORT || 18761);
@@ -58,7 +61,7 @@ fs.mkdirSync(profileDir,{recursive:true,mode:0o700});
 app.setPath('userData', profileDir);
 app.setName(LEGACY_PROFILE_NAME);
 app.setPath('userData', profileDir);
-app.setAboutPanelOptions({applicationName: PRODUCT_NAME});
+app.setAboutPanelOptions({applicationName: PRODUCT_NAME, applicationVersion:app.getVersion(), version:config.build || '开发版'});
 app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
 // Chromium chooses a free local port and writes DevToolsActivePort into userData.
 app.commandLine.appendSwitch('remote-debugging-port', '0');
@@ -87,23 +90,33 @@ const PAGE_ZOOM_MIN = 0.65, PAGE_ZOOM_MAX = 1;
 let win, dashboard, bridge, endpoint, activeLease = null, selected = 'workbench', notice = '', quitting = false, flushing = false, storageFlushed = false;
 let connectionStatus = 'connecting', connectionErrorCode = null, connectionPromise = null, bridgePromise = null;
 let selectionRevision = 0;
+let githubUpdater, updateInstallBusy = false;
 let sessionMonitorTimer, sessionMonitorBusy = false;
-let publicationMode='draft';
+let publicationMode='draft', publicationPermit=null;
+let pageOperation=null, pageOperationController=null;
 let progressMonitorTimer, progressMonitorBusy = false, taskProgress = null;
 const PROGRESS_VIEW_TOP = 216;
 const progressStages = ['session','video','upload','content','cover','save','verify'];
 const progressStatuses = new Set(['pending','running','login_verified','local_draft_verified','platform_draft_verified',
   'platform_snapshot_verified','saved_unverified','result_unknown','risk_paused','platform_restricted','adapter_mismatch',
-  'needs_reauthentication','account_mismatch','failed','cancelled']);
+  'needs_reauthentication','account_mismatch','failed','cancelled','published_submission_verified','published_unverified','publication_blocked']);
 const bridgeToken = crypto.randomBytes(32).toString('hex');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function privateAccessNotice(waiting) {
+  if(quitting || !win || win.isDestroyed() || activeLease) return;
+  notice=waiting ? '正在访问草稿资料目录，可稍后重新连接工作台。' :
+    '无法写入工作台运行记录，请检查资料目录是否可访问后重新连接工作台。';
+  // Do not call update(): reporting a write error must not enqueue another write.
+  win.webContents.send('browser-state',shellState());
+}
+const privateIO=createPrivateIO({dir:privateDir,io:fs.promises,pid:process.pid,shouldContinue:()=>!quitting,
+  onWait:()=>privateAccessNotice(true),onStatusError:()=>privateAccessNotice(false)});
 
 function writeStatus() {
   if (!win || win.isDestroyed()) return;
-  fs.mkdirSync(privateDir, {recursive:true, mode:0o700});
-  fs.writeFileSync(path.join(privateDir, 'embedded-app-status.json'), JSON.stringify({
+  privateIO.status({
     status:connectionStatus==='ready'?'ready':connectionStatus==='connecting'?'connecting':'connection_failed',
-    connection:{status:connectionStatus,errorCode:connectionErrorCode}, pid:process.pid, version:app.getVersion(), bundlePath:app.getPath('exe'),
+    connection:{status:connectionStatus,errorCode:connectionErrorCode}, pid:process.pid, version:app.getVersion(), build:config.build || null, bundlePath:app.getPath('exe'),
     selected, windowVisible:win.isVisible(), windowFocused:win.isFocused(), windowMinimized:win.isMinimized(),
     platformCount:Object.keys(platforms).length,
     browser:'embedded-chromium', notice, active:!!activeLease,
@@ -112,7 +125,7 @@ function writeStatus() {
       visible:v.getVisible(), attached:win.contentView.children.includes(v), bounds:v.getBounds(),
       focused:v.webContents.isFocused(), backgroundThrottling:v.webContents.getBackgroundThrottling()})),
     date:new Date().toISOString(),
-  }, null, 2), {mode:0o600});
+  });
 }
 function creatorPageMatches(id, url) {
   try {
@@ -121,13 +134,13 @@ function creatorPageMatches(id, url) {
   } catch { return false; }
 }
 async function monitorSessions() {
-  if (quitting || sessionMonitorBusy || activeLease?.action === 'draft') return;
+  if (quitting || sessionMonitorBusy || ['draft','publish'].includes(activeLease?.action)) return;
   sessionMonitorBusy = true;
   try {
     const checkedAt = Date.now() / 1000;
     const statuses = {};
     for (const id of Object.keys(platforms)) {
-      if (quitting || activeLease?.action === 'draft') return;
+      if (quitting || ['draft','publish'].includes(activeLease?.action)) return;
       const wc = views.get(id)?.webContents;
       const status = { status: 'needs_confirmation', identity: null, checked_at: checkedAt };
       statuses[id] = status;
@@ -145,7 +158,7 @@ async function monitorSessions() {
           ]);
         } finally { clearTimeout(timeout); }
       } catch { continue; }
-      if (quitting || activeLease?.action === 'draft') return;
+      if (quitting || ['draft','publish'].includes(activeLease?.action)) return;
       if (wc.isDestroyed() || wc.isLoading() || wc.getURL() !== urlBefore) continue;
       if (owner?.loggedOut === true) status.status = 'needs_reauthentication';
       else if (typeof owner?.owner === 'string' && owner.owner.trim() && owner.owner.length <= 512) {
@@ -159,13 +172,9 @@ async function monitorSessions() {
         if (Object.keys(capabilities).length) status.capabilities = capabilities;
       }
     }
-    if (quitting || activeLease?.action === 'draft') return;
-    const temporary = sessionStatusFile + '.' + process.pid + '.tmp';
-    try {
-      fs.writeFileSync(temporary, JSON.stringify({ pid: process.pid, checked_at: checkedAt, platforms: statuses }), { mode: 0o600 });
-      fs.renameSync(temporary, sessionStatusFile);
-      fs.chmodSync(sessionStatusFile, 0o600);
-    } finally { try { fs.unlinkSync(temporary); } catch {} }
+    if (quitting || ['draft','publish'].includes(activeLease?.action)) return;
+    await privateIO.session({pid:process.pid,checked_at:checkedAt,platforms:statuses},
+      ()=>!quitting && !['draft','publish'].includes(activeLease?.action));
   } catch {
     // A failed read leaves the last observation to expire; it never changes
     // account markers, the user's current page, or a pending draft operation.
@@ -190,7 +199,7 @@ function publicTaskProgress(data) {
   if (!data || data.available!==true) throw new Error('Progress response unavailable');
   if (data.job===null) return {available:true,connected:true,job:null,observed_at:Date.now()/1000};
   const job=data.job;
-  if (!job || !platforms[job.platform] || !['login','draft'].includes(job.action) ||
+  if (!job || !platforms[job.platform] || !['login','draft','publish'].includes(job.action) ||
       typeof job.id!=='string' || !/^[A-Za-z0-9_-]{1,80}$/.test(job.id)) throw new Error('Invalid progress response');
   const count=Number.isSafeInteger(job.platform_count) && job.platform_count>=1 && job.platform_count<=7 ? job.platform_count : 1;
   const index=Number.isSafeInteger(job.platform_index) && job.platform_index>=1 && job.platform_index<=count ? job.platform_index : 1;
@@ -202,6 +211,7 @@ function publicTaskProgress(data) {
     completed:progressStages.filter(stage=>Array.isArray(current.completed) && current.completed.includes(stage)),
     skipped:progressStages.filter(stage=>Array.isArray(current.skipped) && current.skipped.includes(stage)),
     operations:progressModel.clean(current.operations),
+    ...(Array.isArray(current.active_stages) && current.active_stages.length>1 ? {active_stages:progressStages.filter(stage=>current.active_stages.includes(stage))} : {}),
   } : null;
   return {available:true,connected:true,observed_at:Date.now()/1000,job:{
     id:job.id,action:job.action,active:job.active===true,platform:job.platform,
@@ -250,7 +260,7 @@ function startProgressMonitor() {
   progressMonitorTimer.unref();
 }
 function selectedPopup() {return popupViews.filter(p=>p.platform===selected).at(-1);}
-function navigationLocked() {return activeLease?.action==='draft';}
+function navigationLocked() {return ['draft','publish'].includes(activeLease?.action);}
 function platformZoomFactor(id,bounds) {
   const preference=pageZoomPreferences.get(id);
   if(preference?.fit===false) return preference.factor;
@@ -261,7 +271,9 @@ function platformZoomFactor(id,bounds) {
 }
 function platformBounds() {
   const [width,height]=win.getContentSize();
-  const top=visibleTaskProgress()?.job ? PROGRESS_VIEW_TOP : 76;
+  const job=visibleTaskProgress()?.job;
+  const shown=!!job && (job.active===true || selected==='workbench' || selected===job.platform);
+  const top=shown ? PROGRESS_VIEW_TOP : 76;
   return {x:224,y:top,width:Math.max(1,width-224),height:Math.max(1,height-top)};
 }
 const nativeViewPainter=createNativeViewPainter({bounds:platformBounds,settled:update,
@@ -293,12 +305,14 @@ function setPageZoom(factor=null) {
 function shellState() {
   const popup=selectedPopup();
   const v = popup?.view || views.get(selected);
-  return {selected, platforms:Object.entries(platforms).map(([id,p])=>({id,name:p.name,
+  return {selected, version:app.getVersion(), build:config.build || null,
+    softwareUpdate:{...githubUpdater?.state(),installing:updateInstallBusy}, repositoryURL:REPOSITORY_URL,
+    platforms:Object.entries(platforms).map(([id,p])=>({id,name:p.name,
       ...(p.automation_ready===false?{automation_ready:false,readiness_message:p.readiness_message}: {})})),
     active:!!activeLease, activePlatform:activeLease?.platform || null,
     activeAction:activeLease?.action || null, navigationLocked:navigationLocked(),
     publicationMode, manualPublishAllowed:canPublishManually(publicationMode,activeLease,visibleTaskProgress()?.job?.active),
-    notice, connection:{status:connectionStatus,errorCode:connectionErrorCode}, popup:!!popup,taskProgress:visibleTaskProgress(),zoom:pageZoomState(),
+    pageOperation, notice, connection:{status:connectionStatus,errorCode:connectionErrorCode}, popup:!!popup,taskProgress:visibleTaskProgress(),zoom:pageZoomState(),
     ...(process.env.SAU_DESKTOP_TEST==='1' ? {viewVisibility:{workbench:dashboard.getVisible(),
       platforms:Object.fromEntries([...views].map(([id,view])=>[id,view.getVisible()])),
       popups:popupViews.map(p=>({platform:p.platform,visible:p.view.getVisible()}))}} : {}),
@@ -334,7 +348,7 @@ function currentView() {
   return selected==='workbench'?dashboard:selectedPopup()?.view || views.get(selected);
 }
 function showView(id,focus=false) {
-  if(focus) selectionRevision++;
+  if(focus) {selectionRevision++;pageOperationController?.abort();pageOperation=null;}
   selected = id;
   setViewVisibility(dashboard,id==='workbench');
   const popup=selectedPopup();
@@ -382,11 +396,13 @@ const publicationPermissions=new WeakMap();
 async function syncPublicationMode(view,force=false){
   if(!view||view.webContents.isDestroyed())return;
   const wc=view.webContents;
-  const allowed=canPublishManually(publicationMode,activeLease,visibleTaskProgress()?.job?.active);
-  if(!force&&publicationPermissions.get(view)===allowed)return;
-  publicationPermissions.set(view,allowed);
+  const scoped=publicationPermit && publicationPermit.lease===activeLease?.id && activeLease?.action==='publish' && publicationPermit.view===view;
+  const allowed=scoped || canPublishManually(publicationMode,activeLease,visibleTaskProgress()?.job?.active);
+  const key=scoped?'scoped:'+publicationPermit.lease:allowed?'manual':'draft';
+  if(!force&&publicationPermissions.get(view)===key)return;
+  publicationPermissions.set(view,key);
   try{
-    wc.send('publication-mode',allowed);
+    wc.send('publication-mode',scoped?{once:true,lease:publicationPermit.lease}:allowed);
     for(const frame of wc.mainFrame.framesInSubtree || [wc.mainFrame]){
       try{await frame.executeJavaScript('window.__sauDraftGuardControl?.setEnabled('+String(!allowed)+')');}catch(_){/* Detached or not yet loaded. */}
     }
@@ -409,9 +425,7 @@ function configureRemote(view, platform) {
     if(quitting || !win || win.isDestroyed() || wc.isDestroyed()
       || event.sender!==wc || event.senderFrame!==wc.mainFrame
       || currentView()!==view || !view.getVisible())return;
-    notice=platform==='douyin'
-      ? '当前仅保存草稿；抖音请点击「暂存离开」保存。'
-      : '当前仅保存草稿；请回到素材工作台，点击「开始上传并保存草稿」。';
+    notice='当前仅保存草稿，已拦截公开投稿。要在'+platforms[platform].name+'发表，请点击上方「开启网页发表」，再点击平台的投稿或发布按钮。';
     update();
   });
   wc.on('will-navigate', (event,url)=>{if(!validRemoteURL(url)){event.preventDefault();notice='这个链接暂时无法在应用内打开。';update();}});
@@ -420,7 +434,8 @@ function configureRemote(view, platform) {
     // the user explicitly approves, and never interrupt a draft/background page.
     const canConfirm=()=>!quitting && !navigationLocked() && win && !win.isDestroyed()
       && !wc.isDestroyed() && currentView()===view && view.getVisible();
-    if(!canConfirm()) return;
+    if(!canConfirm()){notifyPageUnload(wc,'cancel');return;}
+    notifyPageUnload(wc,'waiting');
     let choice;
     try {
       choice=dialog.showMessageBoxSync(win,{
@@ -428,9 +443,10 @@ function configureRemote(view, platform) {
         message:'平台页面有未保存的素材，是否离开？',
         buttons:['继续离开','保留页面'],defaultId:1,cancelId:1,noLink:true
       });
-    } catch {return;}
+    } catch {notifyPageUnload(wc,'cancel');return;}
     // The native dialog can run a nested event loop: recheck the task and view.
-    if(choice===0 && canConfirm()) event.preventDefault();
+    if(choice===0 && canConfirm()) {notifyPageUnload(wc,'continue');event.preventDefault();}
+    else notifyPageUnload(wc,'cancel');
   });
   // Keep window.open/OAuth relationships intact while putting its WebContents in this window.
   wc.setWindowOpenHandler(({url}) => {
@@ -497,16 +513,17 @@ const backendManager=createBackendManager({baseURL:backendURL,port:backendPort,s
   start:async()=>{
     // Existing listeners are never stopped. The manager only reaches this
     // after an explicit connection refusal and permits one spawn per app run.
-    const log=fs.openSync(path.join(privateDir,'workbench.log'),'a',0o600);
+    const log=await privateIO.openLog();
     let child;
     try {
+      if(quitting)throw Object.assign(new Error('工作台已关闭。'),{code:'CONNECTION_CLOSED',backendNotStarted:true});
       child=spawn(runtime.command[0],runtime.command.slice(1),{
-        cwd:root,detached:true,windowsHide:true,stdio:['ignore',log,log],env:{...process.env,
+        cwd:root,detached:true,windowsHide:true,stdio:['ignore',log.fd,log.fd],env:{...process.env,
           PYTHONUTF8:'1',PYTHONIOENCODING:'utf-8',SAU_MEDIA_TOOLS:runtime.tools||'',
           NO_PROXY:[process.env.NO_PROXY||'', '127.0.0.1','localhost','::1'].join(','),
           no_proxy:[process.env.no_proxy||'', '127.0.0.1','localhost','::1'].join(','),
           SAU_WORKBENCH_PORT:String(backendPort),SAU_WORKBENCH_PRIVATE:privateDir,SAU_EMBEDDED_DESCRIPTOR:descriptor}});
-    } finally {fs.closeSync(log);}
+    } finally {void privateIO.close(log);}
     const spawned=new Promise((resolve,reject)=>{
       child.once('error',reject);
       child.once('spawn',()=>{child.unref();resolve();});
@@ -519,6 +536,7 @@ function debuggingEndpoint() {
     shouldContinue:()=>!quitting});
 }
 function startBridge() {
+  if(bridgePromise) return bridgePromise;
   if(bridge?.listening) return Promise.resolve();
   if(!bridgePromise) bridgePromise=createBridge().finally(()=>{bridgePromise=null;});
   return bridgePromise;
@@ -532,7 +550,8 @@ async function createBridge() {
       let body='';for await(const chunk of req){body+=chunk;if(body.length>8192)throw new Error('请求过大');}
       const data=JSON.parse(body);
       if(req.url==='/prepare') {
-        if(!platforms[data.platform] || !['login','draft'].includes(data.action))throw new Error('操作无效');
+        if(updateInstallBusy || quitting)throw new Error('正在安装软件更新，请稍后再开始任务。');
+        if(!platforms[data.platform] || !['login','draft','publish'].includes(data.action))throw new Error('操作无效');
         if(activeLease)throw new Error('内嵌浏览器正在处理另一项任务。');
         const lease={platform:data.platform, action:data.action,id:crypto.randomUUID()};
         activeLease=lease;update();
@@ -549,18 +568,29 @@ async function createBridge() {
           let target;
           try {target=await debug.sendCommand('Target.getTargetInfo');}finally{debug.detach();}
           if(activeLease!==lease || !await settleSelectedFocus(view,revision)) throw new Error('当前平台页面已切换或未获得焦点，请回到该平台后继续任务。');
+          lease.view=view;
           respond({endpoint,targetId:target.targetInfo.targetId,lease:lease.id});
         } catch(e){if(activeLease===lease)activeLease=null;update();throw e;}
+      } else if(req.url==='/publish-permit') {
+        if(activeLease?.id!==data.lease || activeLease?.action!=='publish' || activeLease?.platform!==data.platform
+          || !activeLease.view || activeLease.view!==currentView() || activeLease.permitGrantedOnce || activeLease.view.webContents.isDestroyed())throw new Error('投稿许可与当前任务页面不匹配');
+        activeLease.permitGrantedOnce=true;
+        publicationPermit={lease:activeLease.id,view:activeLease.view};
+        await syncPublicationMode(activeLease.view,true);update();respond({ok:true});
+      } else if(req.url==='/publish-revoke') {
+        if(activeLease?.id!==data.lease || activeLease?.platform!==data.platform)throw new Error('任务标识已失效');
+        publicationPermit=null;
+        await syncPublicationMode(activeLease.view,true);update();respond({ok:true});
       } else if(req.url==='/cancel') {
         if(activeLease && activeLease.platform!==data.platform)throw new Error('平台与当前任务不匹配');
         if(activeLease){const ses=views.get(activeLease.platform).webContents.session;ses.flushStorageData();await ses.cookies.flushStore();}
-        activeLease=null;update();
+        publicationPermit=null;activeLease=null;update();
         await Promise.all([...views.values()].map(syncPublicationMode));respond({ok:true});
       } else if(req.url==='/finished') {
         if(activeLease?.id!==data.lease)throw new Error('任务标识已失效');
         const view=views.get(activeLease.platform);
         view.webContents.session.flushStorageData();await view.webContents.session.cookies.flushStore();
-        activeLease=null;update();
+        publicationPermit=null;activeLease=null;update();
         await Promise.all([...views.values()].map(syncPublicationMode));respond({ok:true});
       } else if(req.url==='/test-quit' && process.env.SAU_DESKTOP_TEST==='1') {
         respond({ok:true});setImmediate(()=>app.quit());
@@ -572,7 +602,8 @@ async function createBridge() {
     await withTimeout(()=>new Promise((resolve,reject)=>{
       server.once('error',reject);server.listen(0,'127.0.0.1',resolve);
     }),1500,'BRIDGE_START_TIMEOUT');
-    fs.writeFileSync(descriptor,JSON.stringify({pid:process.pid,url:`http://127.0.0.1:${server.address().port}`,token:bridgeToken}),{mode:0o600});
+    await privateIO.descriptor({pid:process.pid,url:`http://127.0.0.1:${server.address().port}`,token:bridgeToken},
+      ()=>bridge===server && server.listening && !quitting);
   } catch(error) {
     server.close();if(bridge===server)bridge=null;throw error;
   }
@@ -620,20 +651,35 @@ function trusted(event) {
   return event.senderFrame===event.sender.mainFrame && (event.sender===win.webContents || event.sender===dashboard.webContents);
 }
 function ipc(name,handler) {ipcMain.handle(name,async(event,...args)=>{if(!trusted(event))throw new Error('无效的页面来源');return handler(...args);});}
+async function performPageOperation(kind) {
+  if(selected==='workbench')throw new Error('请先打开一个平台页面。');
+  if(kind==='reload' && (navigationLocked() || visibleTaskProgress()?.job?.active))throw new Error('视频正在处理，请先在素材工作台停止任务再重新加载。');
+  const view=currentView(),revision=selectionRevision;
+  const isCurrent=()=>!quitting && revision===selectionRevision && currentView()===view;
+  pageOperationController?.abort();
+  const controller=new AbortController();pageOperationController=controller;
+  notice='';
+  try {
+    const receipt=await runPageOperation({kind,view,isCurrent,
+      onState:state=>{pageOperation=state;update();},
+      repair:(target,options)=>nativeViewPainter.repair(target,options),signal:controller.signal});
+    if(receipt.status==='failed' && isCurrent())throw new Error(receipt.detail);
+    return shellState();
+  } finally {if(pageOperationController===controller)pageOperationController=null;}
+}
 function configureIPC() {
   ipc('browser-state',()=>shellState());
+  ipc('github-open',()=>shell.openExternal(REPOSITORY_URL));
+  ipc('update-check',()=>githubUpdater.check());
+  ipc('update-install',installSoftwareUpdate);
   ipc('cover-copy',path=>copyCover(path));
   ipc('publication-mode',setPublicationMode);
   ipc('browser-reconnect',async()=>{await connectWorkbench(true);return shellState();});
   ipc('browser-select',async id=>{await selectPlatform(id);return shellState();});
   ipc('browser-fit',()=>setPageZoom());
   ipc('browser-zoom',factor=>setPageZoom(factor));
-  ipc('browser-repair-display',async()=>{
-    if(selected==='workbench')throw new Error('请先打开一个平台页面。');
-    if(!await nativeViewPainter.repair(currentView()))throw new Error('页面当前不可见，请打开平台页面后重试。');
-    return shellState();
-  });
-  ipc('browser-reload',()=>{if(navigationLocked())throw new Error('请先停止任务再重新加载。');(selectedPopup()?.view || views.get(selected))?.webContents.reload();});
+  ipc('browser-repair-display',()=>performPageOperation('repair'));
+  ipc('browser-reload',()=>performPageOperation('reload'));
   ipc('browser-back',()=>{if(navigationLocked())throw new Error('请先停止任务再返回。');const wc=(selectedPopup()?.view || views.get(selected))?.webContents;if(wc?.navigationHistory.canGoBack())wc.navigationHistory.goBack();});
   ipc('browser-close-popup',async()=>{const child=selectedPopup();if(child){popupViews.splice(popupViews.indexOf(child),1);setViewVisibility(child.view,false);child.view.webContents.close();showView(selected,true);await settleSelectedFocus(currentView(),selectionRevision);}});
   ipc('browser-stop-login',async()=>{
@@ -655,8 +701,52 @@ function configureIPC() {
     const result=await dialog.showOpenDialog(win,options);return result.canceled?null:result.filePaths[0];
   });
 }
+async function assertUpdateIdle() {
+  if (activeLease || visibleTaskProgress()?.job?.active || pageOperation?.status==='running') throw new Error('请等待当前任务完成，再安装更新。');
+  const response=await fetch(`${backendURL}/api/state`,{signal:AbortSignal.timeout(5000)});
+  if(!response.ok)throw new Error('未能确认后台空闲，请重新连接工作台后再安装更新。');
+  const state=await response.json();
+  if(state.app!=='sau-draft-workbench' || state.job?.active)throw new Error('后台仍在执行任务，暂不能安装更新。');
+}
+async function ownedUpdateBackend() {
+  const owner=JSON.parse(await fs.promises.readFile(path.join(privateDir,'backend-owner.json'),'utf8'));
+  if(!Number.isSafeInteger(owner.pid) || owner.pid<=0 || path.resolve(owner.executable || '')!==path.resolve(runtime.command[0]))throw new Error('后台进程身份未确认，已停止安装。');
+  const execute=require('node:util').promisify(require('node:child_process').execFile);
+  if(process.platform==='darwin') {
+    const result=await execute('/bin/ps',['-ww','-p',String(owner.pid),'-o','command=']);
+    if(result.stdout.trim()!==owner.executable+' server')throw new Error('后台进程已变化，已停止安装。');
+  } else {
+    const result=await execute('powershell.exe',['-NoProfile','-NonInteractive','-Command',`(Get-CimInstance Win32_Process -Filter "ProcessId = ${owner.pid}").ExecutablePath`]);
+    if(result.stdout.trim().toLowerCase()!==owner.executable.toLowerCase())throw new Error('后台进程已变化，已停止安装。');
+  }
+  return owner;
+}
+async function installSoftwareUpdate() {
+  if(updateInstallBusy)throw new Error('正在准备安装更新。');
+  if(!app.isPackaged || process.env.SAU_DESKTOP_TEST==='1')throw new Error('安装更新仅在正式安装的应用中启用。');
+  updateInstallBusy=true;update();
+  let prepared;
+  try {
+    await assertUpdateIdle();
+    const {asset,file}=await githubUpdater.downloaded();
+    const answer=await dialog.showMessageBox(win,{type:'info',title:'安装发布助手更新',
+      message:`v${asset.version} 已下载并通过 SHA-256 校验`,
+      detail:process.platform==='darwin'?'安装将退出并重新打开发布助手。素材、任务记录和登录资料会保留，旧版应用会保留为回滚副本。':'安装将退出发布助手并打开新版安装向导。请选择现有安装位置；素材、任务记录和登录资料会保留。',
+      buttons:['安装更新','稍后'],defaultId:1,cancelId:1});
+    if(answer.response!==0)return;
+    await assertUpdateIdle();
+    const backend=await ownedUpdateBackend();
+    prepared=await prepareInstallation({file,version:asset.version,executable:app.getPath('exe'),cacheDir:path.dirname(file),backend});
+    await assertUpdateIdle();
+    await prepared.launch();
+    quitting=true;app.quit();
+  } catch(error) {
+    if(prepared)await prepared.cancel();
+    throw error;
+  } finally {updateInstallBusy=false;if(!quitting)update();}
+}
 async function boot() {
-  fs.mkdirSync(privateDir,{recursive:true,mode:0o700});
+  // Render the local shell before touching the protected legacy data folder.
   win=new BrowserWindow({width:1320,height:900,minWidth:1000,minHeight:640,title:PRODUCT_NAME,
     titleBarStyle:process.platform==='darwin'?'hiddenInset':'default',trafficLightPosition:{x:28,y:28},
     backgroundColor:'#b3c6e4',webPreferences:{preload:path.join(__dirname,'preload.cjs'),sandbox:true,contextIsolation:true,nodeIntegration:false}});
@@ -671,8 +761,12 @@ async function boot() {
   win.webContents.on('will-navigate',event=>event.preventDefault());
   win.webContents.setWindowOpenHandler(()=>({action:'deny'}));
   win.contentView.addChildView(dashboard);layout();dashboard.setVisible(false);
+  githubUpdater=createGitHubUpdater({version:app.getVersion(),cacheDir:path.join(app.getPath('userData'),'software-updates'),
+    fetchImpl:(...args)=>net.fetch(...args),enabled:app.isPackaged && process.env.SAU_DESKTOP_TEST!=='1',onState:()=>update()});
   configureIPC();
   Menu.setApplicationMenu(Menu.buildFromTemplate([{label:PRODUCT_NAME,submenu:[{role:'about',label:'关于'+PRODUCT_NAME},
+    {label:'检查软件更新',click:()=>{void githubUpdater.check();}},
+    {label:'在 GitHub 上支持发布助手',click:()=>{void shell.openExternal(REPOSITORY_URL);}},
     {label:'重新连接工作台',click:()=>{void connectWorkbench(true).catch(error=>{if(!quitting){notice=error.message;update();}});}},
     {type:'separator'},{role:'hide',label:'隐藏'+PRODUCT_NAME},{role:'quit',label:'退出'+PRODUCT_NAME}]},
     {label:'编辑',submenu:[{role:'undo'},{role:'redo'},{type:'separator'},{role:'cut'},{role:'copy'},{role:'paste'},{role:'selectAll'}]},
@@ -688,6 +782,7 @@ async function boot() {
     });
   });
   await win.loadFile(path.join(__dirname,'shell.html'));
+  githubUpdater.start();
   await connectWorkbench();
 }
 if(!app.requestSingleInstanceLock()){app.quit();}else{
@@ -696,6 +791,8 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
   app.whenReady().then(boot).catch(error=>{if(!quitting){notice=error.message;update();dialog.showErrorBox('工作台未能启动',error.message);}});
 }
 app.on('before-quit',event=>{quitting=true;
+  githubUpdater?.stop();
+  privateIO.stop();
   nativeViewPainter.stop();
   clearInterval(sessionMonitorTimer);
   clearInterval(progressMonitorTimer);
@@ -706,13 +803,13 @@ app.on('before-quit',event=>{quitting=true;
     const sessions=new Set([...views.values(),...popupViews.map(p=>p.view)].map(v=>v.webContents.session));
     const pending=[...sessions].map(async ses=>{ses.flushStorageData();await ses.cookies.flushStore();});
     if(dashboard && !dashboard.webContents.isDestroyed())pending.push(dashboard.webContents.executeJavaScript('window.flushWorkbenchEditor?.()'));
+    pending.push(privateIO.removeDescriptor());
     Promise.allSettled(pending).then(()=>{
       storageFlushed=true;app.quit();
     });
     return;
   }
   if(bridge)bridge.close();
-  try{const data=JSON.parse(fs.readFileSync(descriptor,'utf8'));if(data.pid===process.pid)fs.unlinkSync(descriptor);}catch{}
   for(const v of views.values()){v.webContents.session.flushStorageData();v.webContents.close();}
   for(const p of popupViews)p.view.webContents.close();dashboard?.webContents.close();
 });

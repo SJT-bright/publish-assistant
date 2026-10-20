@@ -23,6 +23,19 @@ def line(job='job-1', platform='xiaohongshu', stage='session', state='running', 
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_upload_and_editor_progress_overlap_without_hiding_work_or_resetting_wait_timer(self):
+        item = {'status': 'running'}
+        for stage, state, at in [('upload', 'running', 10), ('content', 'running', 20), ('upload', 'running', 30)]:
+            self.assertTrue(apply_progress(item, parse_progress(line(stage=stage,state=state),'job-1','xiaohongshu'),at))
+        self.assertEqual(item['progress']['stage'], 'content')
+        self.assertEqual(public_progress(item['progress'])['active_stages'], ['upload','content'])
+        apply_progress(item, parse_progress(line(stage='content',state='completed'),'job-1','xiaohongshu'),40)
+        self.assertEqual(item['progress']['stage'], 'upload')
+        self.assertEqual(item['progress']['started_at'], 10)
+        apply_progress(item, parse_progress(line(stage='upload',state='completed'),'job-1','xiaohongshu'),50)
+        self.assertEqual(item['progress']['completed'], ['upload','content'])
+        self.assertNotIn('active_stages',public_progress(item['progress']))
+
     def test_all_real_emitter_phrases_are_accepted_without_payload_text(self):
         from uploader import draft_progress as emitter
         with patch.dict(emitter.os.environ, {'SAU_PROGRESS_JOB_ID': 'job-1', 'SAU_PROGRESS_PLATFORM': 'xiaohongshu'}):

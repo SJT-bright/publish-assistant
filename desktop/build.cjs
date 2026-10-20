@@ -7,6 +7,7 @@ const ROOT = path.resolve(__dirname, '..');
 const pkg = require('./package.json');
 const platform = process.env.PUBLISH_ASSISTANT_TARGET || process.platform;
 const arch = process.env.PUBLISH_ASSISTANT_ARCH || process.arch;
+const buildVersion = process.env.PUBLISH_ASSISTANT_BUILD_VERSION || '45';
 const targetBackend = path.join(ROOT, 'build/runtime/PublishAssistantBackend');
 const targetTools = process.env.PUBLISH_ASSISTANT_TOOLS || path.join(ROOT, 'build/media/tools');
 
@@ -26,12 +27,12 @@ async function build() {
     }
     fs.cpSync(path.join(ROOT,'ui-assets'),path.join(stage,'ui-assets'),{recursive:true});
     let revision='development';try{revision=execFileSync('git',['rev-parse','HEAD'],{cwd:ROOT,encoding:'utf8'}).trim();}catch{}
-    fs.writeFileSync(path.join(stage,'runtime.json'), JSON.stringify({bundled:true,version:pkg.version,source_revision:revision}));
+    fs.writeFileSync(path.join(stage,'runtime.json'), JSON.stringify({bundled:true,version:pkg.version,build:buildVersion,source_revision:revision}));
     fs.writeFileSync(path.join(stage,'package.json'),JSON.stringify({name:pkg.name,productName:pkg.productName,version:pkg.version,main:pkg.main,author:pkg.author,description:pkg.description,license:'MIT'}));
     const output = await packager({dir:stage,name:'发布助手',executableName:'DraftWorkbench',platform,arch,
       electronVersion:pkg.devDependencies.electron,electronZipDir:process.env.PUBLISH_ASSISTANT_ELECTRON_ZIPS,
       out:path.join(ROOT,'dist'),overwrite:true,asar:true,appBundleId:'local.sijunting.social-auto-upload.drafts',
-      appVersion:pkg.version,buildVersion:'28',icon:path.join(__dirname,platform==='win32'?'AppIcon.ico':'AppIcon.icns'),
+      appVersion:pkg.version,buildVersion,icon:path.join(__dirname,platform==='win32'?'AppIcon.ico':'AppIcon.icns'),
       extendInfo:platform==='darwin'?{CFBundleDisplayName:'发布助手',LSMinimumSystemVersion:'13.0',WorkbenchBundledRuntime:true}:undefined});
     const folder = output[0];
     const resources = platform==='darwin'?path.join(folder,'发布助手.app/Contents/Resources'):path.join(folder,'resources');

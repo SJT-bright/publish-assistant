@@ -22,7 +22,9 @@ for _id, _limits in TEXT_LIMITS.items():
     PLATFORM_POLICIES[_id].update(_limits)
 VERIFIED_STATUSES = frozenset(p['verified_status'] for p in PLATFORM_POLICIES.values())
 UNRESOLVED_STATUSES = frozenset({'saved_unverified', 'result_unknown', 'risk_paused', 'platform_restricted', 'adapter_mismatch'})
-RESULT_STATUSES = VERIFIED_STATUSES | UNRESOLVED_STATUSES | {'needs_reauthentication', 'account_mismatch', 'failed', 'cancelled'}
+PUBLICATION_VERIFIED_STATUSES = frozenset({'published_submission_verified'})
+PUBLICATION_STATUSES = PUBLICATION_VERIFIED_STATUSES | {'published_unverified', 'publication_blocked'}
+RESULT_STATUSES = PUBLICATION_STATUSES | VERIFIED_STATUSES | UNRESOLVED_STATUSES | {'needs_reauthentication', 'account_mismatch', 'failed', 'cancelled'}
 IDENTITY_FIELDS = ('job_id', 'platform_id', 'video_sha256', 'account_key', 'content_sha256', 'cover_sha256', 'operation_key', 'receipt_nonce')
 VERIFICATION_FIELDS = ('upload_complete', 'fields', 'cover', 'media', 'reopened', 'account')
 VIDEO_EXT = {'.mp4', '.mov', '.m4v', '.webm', '.avi', '.mkv'}
@@ -84,6 +86,10 @@ def preflight_payload(payload, platforms, account_keys=None, capabilities=None):
     if not selected or any(p not in PLATFORM_POLICIES for p in selected):
         raise ValueError('请选择有效的平台。')
     normalized = {k: payload.get(k, '') for k in ('folder', 'video', 'title', 'description', 'short_title', *COVER_FIELDS)}
+    if payload.get('workflow_action') not in (None, 'draft', 'publish'):
+        raise ValueError('结束方式无效。')
+    if payload.get('workflow_action') == 'publish':
+        normalized['workflow_action'] = 'publish'
     normalized['title'] = str(normalized['title']).strip()
     normalized['description'] = str(normalized['description'])
     normalized['short_title'] = str(normalized['short_title']).strip()
@@ -166,6 +172,8 @@ def preflight_payload(payload, platforms, account_keys=None, capabilities=None):
         content_sha = canonical_sha(content_fields)
         account_key = (account_keys or {}).get(platform) or payload.get('account_key') or 'default:' + platform
         fingerprint = {'platform_id': platform, 'account_key': account_key, 'video_sha256': video_sha, 'content_sha256': content_sha, 'cover_sha256': cover_sha}
+        if normalized.get('workflow_action') == 'publish':
+            fingerprint['workflow_action'] = 'publish'
         fingerprint['operation_key'] = canonical_sha(fingerprint)
         fingerprints[platform] = fingerprint
     return {'payload': normalized, 'mappings': mappings, 'fingerprints': fingerprints, 'errors': errors, 'warnings': warnings}
@@ -194,7 +202,7 @@ def validate_receipt(receipt, expected_payload, platform=None, created_at=None):
         if key not in receipt or receipt[key] != expected_payload.get(key):
             raise ValueError('草稿回执与本次任务不匹配：' + key)
     status = receipt.get('status')
-    if status not in RESULT_STATUSES:
+    if status not in RESULT_STATUSES or status in PUBLICATION_STATUSES:
         raise ValueError('回执未提供可核验的草稿状态。')
     if status in VERIFIED_STATUSES:
         policy = PLATFORM_POLICIES[platform]
@@ -215,4 +223,39 @@ def validate_receipt(receipt, expected_payload, platform=None, created_at=None):
             raise ValueError('回执缺少实际草稿标识或保存位置。')
         if receipt.get('partial'):
             raise ValueError('部分完成的任务不能标为草稿核验通过。')
+    return receipt
+
+
+def validate_publication_receipt(receipt, expected_payload, platform=None, created_at=None):
+    """A submission is verified only by this attempt's preparation and acceptance."""
+    platform = platform or expected_payload.get('platform_id') or expected_payload.get('platform')
+    if expected_payload.get('workflow_action') != 'publish' or platform not in PLATFORM_POLICIES:
+        raise ValueError('投稿回执没有绑定本次投稿任务。')
+    if not isinstance(receipt, dict) or receipt.get('workflow_action') != 'publish':
+        raise ValueError('投稿回执格式无效。')
+    for key in IDENTITY_FIELDS:
+        if receipt.get(key) != expected_payload.get(key) or key not in receipt:
+            raise ValueError('投稿回执与本次任务不匹配：' + key)
+    status = receipt.get('status')
+    if status not in PUBLICATION_STATUSES | {'failed', 'cancelled', 'result_unknown', 'adapter_mismatch',
+                                              'risk_paused', 'needs_reauthentication', 'account_mismatch', 'platform_restricted'}:
+        raise ValueError('回执不是本次投稿的状态。')
+    if status in PUBLICATION_VERIFIED_STATUSES:
+        checks = receipt.get('verification')
+        if not isinstance(checks, dict) or any(checks.get(key) is not True for key in ('upload_complete', 'fields', 'cover', 'media', 'account')):
+            raise ValueError('视频上传、内容、封面、媒体或账号核验未全部通过。')
+        account = receipt.get('account')
+        if not isinstance(account, dict) or account.get('verified') is not True or not account.get('identity') or account.get('platform') != platform:
+            raise ValueError('投稿回执缺少当前平台账号证据。')
+        owner = expected_payload.get('expected_account_identity') or (expected_payload.get('account') or {}).get('identity')
+        if owner and owner != account['identity']:
+            raise ValueError('投稿账号与本次任务账号不匹配。')
+        publication = receipt.get('publication')
+        if not isinstance(publication, dict) or publication.get('status') != 'published_submission_verified' or publication.get('clicked') is not True or not publication.get('evidence'):
+            raise ValueError('投稿尚未取得平台接受证据。')
+        counts = publication.get('counts', publication.get('observation', {}))
+        if not isinstance(counts, dict) or counts.get('publish_requests', 0) > 1 or counts.get('publish_responses', 0) > 1:
+            raise ValueError('投稿请求不能唯一对应本次提交。')
+        if receipt.get('partial'):
+            raise ValueError('部分完成不能标为投稿通过。')
     return receipt

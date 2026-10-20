@@ -695,14 +695,17 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
                 await element.dispose()
             raise
 
-    async def fill_meta(self, page: Page) -> None:
+    async def fill_meta(self, page: Page, *, controls_timeout=30) -> None:
         if getattr(self, "draft_only", False):
             from uploader.draft_only import assert_draft_safe
             if measure(self.title, "xhs_title") > 20 or len(self.tags) > 10:
                 raise ValueError("小红书标题超过 20 字或话题超过 10 个，草稿任务不会截断内容。")
             await assert_draft_safe(page, "小红书")
             form = None
-            deadline = asyncio.get_running_loop().time() + 30
+            # Some platform revisions mount editing controls during transfer;
+            # others mount them after processing. Start looking immediately,
+            # but allow the same bounded upload window for gated controls.
+            deadline = asyncio.get_running_loop().time() + controls_timeout
             while asyncio.get_running_loop().time() < deadline:
                 await assert_draft_safe(page, "小红书")
                 form = await self._draft_content_controls(page)
@@ -908,7 +911,8 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             from uploader.xhs_cover_controls import import_xhs_cover_file, finish_xhs_cover_editor
             with progress_part("cover", "editor"):
                 await assert_draft_safe(page, "小红书")
-                await import_xhs_cover_file(page, thumbnail_path)
+                await import_xhs_cover_file(page, thumbnail_path,
+                    timeout=int(getattr(self, "draft_upload_timeout", 900) * 1000))
             with progress_part("cover", "confirm"):
                 await assert_draft_safe(page, "小红书")
                 await finish_xhs_cover_editor(page)
@@ -982,7 +986,30 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             "/publish/publish?from=homepage&target=video"
         )
         if getattr(self, "draft_only", False):
-            from uploader.draft_only import assert_draft_safe, save_draft, wait_draft_upload, draft_resume_active, checkpoint_after_upload
+            from uploader.draft_only import assert_draft_safe, save_draft, draft_resume_active, checkpoint_after_upload
+            from uploader.upload_pipeline import run_upload_pipeline
+            from uploader.xhs_ks_upload_ready import wait_xhs_ks_upload_complete
+
+            async def wait_upload():
+                with progress_step("upload", operations=["transfer"]):
+                    with progress_part("upload", "transfer"):
+                        await wait_xhs_ks_upload_complete(page, "xiaohongshu", timeout=getattr(self, "draft_upload_timeout", 900))
+                await checkpoint_after_upload(page)
+
+            async def prepare_content():
+                content_plan = draft_xhs_description_plan(self.desc or "", self.tags)
+                content_operations = ["title", "description"]
+                if content_plan['transforms']:
+                    content_operations.append("topics")
+                content_operations.append("readback")
+                with progress_step("content", operations=content_operations):
+                    await self.fill_meta(page, controls_timeout=getattr(self, "draft_upload_timeout", 900))
+                if self.thumbnail_path:
+                    with progress_step("cover", operations=["editor", "confirm"]):
+                        await self.set_thumbnail(page, self.thumbnail_path)
+                else:
+                    emit_progress("cover", "skipped")
+
             if not draft_resume_active(page):
                 with progress_step("video", operations=["locate", "select"]):
                     await assert_draft_safe(page, "小红书")
@@ -1009,26 +1036,10 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                     with progress_part("video", "select"):
                         await self._draft_ensure_sdk_ready(page)
                         await set_local_files(page, upload_input, self.file_path)
-                with progress_step("upload", operations=["transfer"]):
-                    with progress_part("upload", "transfer"):
-                        await wait_draft_upload(page, "小红书", [
-                            '.cover-container > .preview-new',
-                            'div.preview-new :text-is("上传成功")', 'div.preview-new :text-is("重新上传")',
-                            'div.preview-new .stage:has-text("分辨率")', ':text-is("视频上传成功")'
-                        ], ['.cover-container > .uploading', '.cover-container > .transcoding', ':text("上传中")', ':text("转码中")', ':text("处理中")'], timeout=getattr(self, "draft_upload_timeout", 900))
-            await checkpoint_after_upload(page)
-            content_plan = draft_xhs_description_plan(self.desc or "", self.tags)
-            content_operations = ["title", "description"]
-            if content_plan['transforms']:
-                content_operations.append("topics")
-            content_operations.append("readback")
-            with progress_step("content", operations=content_operations):
-                await self.fill_meta(page)
-            if self.thumbnail_path:
-                with progress_step("cover", operations=["editor", "confirm"]):
-                    await self.set_thumbnail(page, self.thumbnail_path)
+                await run_upload_pipeline(page, "xiaohongshu", wait_upload, prepare_content)
             else:
-                emit_progress("cover", "skipped")
+                await checkpoint_after_upload(page)
+                await prepare_content()
             await assert_draft_safe(page, "小红书")
             await save_draft(page, "小红书", self.title, getattr(self, "draft_receipt", None), expected=getattr(self, "draft_expected", None))
             return

@@ -70,6 +70,26 @@ class ExecutionSessionTimeoutTests(unittest.IsolatedAsyncioTestCase):
         return [event for event in events if prefix != 'DRAFT_PROGRESS' or
                 not any(key in event for key in ('plan', 'operation'))]
 
+    async def test_fresh_preflight_account_supersedes_stale_disk_marker(self):
+        self.expected['expected_account_identity'] = 'fixture-owner'
+        with patch.object(execution, 'read_marker', return_value={'account': {'identity': 'previous-login'}}):
+            async with execution.prepared_draft_session('bilibili', {}, True) as prepared:
+                self.assertEqual(prepared[4]['account']['identity'], 'fixture-owner')
+
+    async def test_account_switch_after_preflight_still_blocks_before_upload(self):
+        self.expected['expected_account_identity'] = 'preflight-owner'
+        with self.assertRaises(DraftInterrupted) as caught:
+            async with execution.prepared_draft_session('bilibili', {}, True):
+                self.fail('A different owner must not reach uploader work')
+        self.assertEqual(caught.exception.status, 'account_mismatch')
+
+    async def test_missing_preflight_binding_does_not_bypass_a_different_disk_owner(self):
+        with patch.object(execution, 'read_marker', return_value={'account': {'identity': 'previous-login'}}):
+            with self.assertRaises(DraftInterrupted) as caught:
+                async with execution.prepared_draft_session('bilibili', {}, True):
+                    self.fail('Unbound owner change must be verified first')
+        self.assertEqual(caught.exception.status, 'account_mismatch')
+
     async def test_preparation_timeout_fails_session_without_import_or_second_enter(self):
         @asynccontextmanager
         async def stalled_browser(*args, **kwargs):

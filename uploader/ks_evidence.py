@@ -22,6 +22,7 @@ every remaining authority must still match the original host allowlist.
 from __future__ import annotations
 
 import asyncio
+import math
 import copy
 import hashlib
 import ipaddress
@@ -39,6 +40,7 @@ PATHS = {
     PREFIX + 'v2/video/pc/upload/finish': 'finish',
     PREFIX + 'v4/video/pc/cover/edit/cover/upload': 'cover',
     PREFIX + 'v2/video/pc/upload/cover/upload': 'preview',
+    PREFIX + 'v2/video/pc/upload/cover/view': 'cover_view',
 }
 KEYS = frozenset(('uploadType', 'result', 'data', 'fileId', 'token', 'endPoints',
     'fileName', 'fileLength', 'fileType', 'coverKey', 'duration', 'width', 'height'))
@@ -72,14 +74,42 @@ def _token(value):
     return hashlib.sha256(value.encode()).hexdigest() if value else None
 
 
+def _trusted_pre_candidates(endpoints):
+    """Project known upload candidates; an unknown fallback is never a target.
+
+    The official pre response can carry an unused additional DNS fallback. Its
+    presence does not negate the same current native-file/token/finish chain.
+    Keep the original suffix allowlist for eligible targets and require its
+    primary; ordinary unknown fallback names are omitted from that allowlist.
+    URLs, credentials, ports, whitespace, IP literals and malformed names still
+    invalidate the entire shape. The list bound is local, not an SDK contract.
+    """
+    if not isinstance(endpoints, list) or not 1 <= len(endpoints) <= 128:
+        return ()
+    available = []
+    label = r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?'
+    for value in endpoints:
+        if value == '':
+            continue
+        if (not isinstance(value, str) or len(value) > 253
+                or re.fullmatch(label + r'(?:\.' + label + r')+', value) is None):
+            return ()
+        try:
+            ipaddress.ip_address(value)
+            return ()
+        except ValueError:
+            pass
+        if all(part.isdigit() for part in value.split('.')):
+            return ()
+        available.append(value)
+    if not available or not available[0].endswith('.kuaishouzt.com'):
+        return ()
+    return tuple(dict.fromkeys(value for value in available
+                              if value.endswith('.kuaishouzt.com')))
+
+
 def _pre_endpoints_valid(endpoints):
-    if not isinstance(endpoints,list):
-        return False
-    # Match the pinned SDK's optional empty fallback, without accepting a new
-    # host, scheme, port, object or whitespace-only authority.
-    available=[value for value in endpoints if value!='']
-    return bool(available) and all(isinstance(value,str) and
-        re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)*\.kuaishouzt\.com',value) for value in available)
+    return bool(_trusted_pre_candidates(endpoints))
 
 
 def _pre_gates(payload):
@@ -393,6 +423,15 @@ OBSERVER_JS = r"""cfg => {
   }
  }catch(_){bump('scan_error');}}
  const mutation=new MutationObserver(scan);scan();
+ state.readProgress=async()=>{if(!active())return null;
+  const p=project();if(p.forms.length!==1||p.progress.length!==1)return null;
+  const form=p.forms[0],progress=p.progress[0],file=progress.localFileData;
+  if(progress.status!==2||typeof progress.percent!=='number'||!Number.isFinite(progress.percent)||progress.percent<0||progress.percent>100)return null;
+  const name=Reflect.apply(nativeName,file,[]),size=Reflect.apply(nativeSize,file,[]),sha256=await hash(file);
+  const next=project();if(!active()||next.forms.length!==1||next.progress.length!==1||next.forms[0]!==form||
+      next.progress[0]!==progress||progress.localFileData!==file||name!==form.fileName||size<=0)return null;
+  return {name,size,sha256,percent:progress.percent};
+ };
  state.read=async()=>{await Promise.allSettled([...state.pending]);if(!active())return null;
   const p=project();if(p.forms.length!==1||p.progress.length!==1||p.progress[0].status!==3)return null;
   const form=p.forms[0],progress=p.progress[0],file=progress.localFileData;
@@ -729,6 +768,31 @@ class KSEvidenceObserver:
         operation = ks_endpoint(response.url)
         if not operation or not self._current():
             return
+        if operation == 'cover_view':
+            # Observe only the normal page's post-reopen GET response. No
+            # platform call is issued here; a Blob URL later inherits its
+            # coverKey only by matching these exact response bytes.
+            try:
+                request = response.request
+                parsed = urlsplit(response.url)
+                query = parse_qs(parsed.query, keep_blank_values=True)
+                keys = query.get('coverKey', [])
+                request_at = request.timing.get('startTime') / 1000
+                reopen_at = getattr(self.session, 'reopen_at', None)
+                valid = (request.method == 'GET' and request.frame is self.page.main_frame and
+                         type(reopen_at) in (int, float) and self.started_at <= request_at <= observed_at and
+                         reopen_at <= request_at and len(keys) == 1 and bool(_scalar(keys[0])) and
+                         200 <= response.status < 300)
+                content = await response.body() if valid else None
+                valid = bool(valid and isinstance(content, bytes) and 0 < len(content) <= 32 * 1024 ** 2)
+                record = {'operation': operation, 'request_at': request_at, 'observed_at': observed_at,
+                          'valid': valid, 'cover_key': keys[0] if len(keys) == 1 else None,
+                          'body_sha256': hashlib.sha256(content).hexdigest() if valid else None}
+                if self._current() and len(self.records) < 512:
+                    self.records.append(record)
+            except Exception:
+                pass
+            return
         body, reply = _body(response.request), data if isinstance(data, dict) else {}
         payload = reply.get('data') if isinstance(reply.get('data'), dict) else {}
         try:
@@ -741,9 +805,10 @@ class KSEvidenceObserver:
         record = {'operation': operation, 'request_at': request_at, 'observed_at': observed_at, 'valid': False}
         if operation == 'pre':
             endpoint_list = payload.get('endPoints')
-            allowed = _pre_endpoints_valid(endpoint_list)
+            candidates = _trusted_pre_candidates(endpoint_list)
             record.update(file_id=_scalar(payload.get('fileId')), token_sha256=_token(payload.get('token')),
-                valid=bool(success and _scalar(payload.get('fileId')) and _token(payload.get('token')) and allowed))
+                trusted_endpoint_count=len(candidates),
+                valid=bool(success and _scalar(payload.get('fileId')) and _token(payload.get('token')) and candidates))
         elif operation == 'finish':
             length = body.get('fileLength')
             if isinstance(length, str) and re.fullmatch(r'[1-9][0-9]*', length):
@@ -769,9 +834,29 @@ class KSEvidenceObserver:
                 'request_timing_valid': timed, 'parsed': record['valid']}
             if operation == 'pre':
                 diagnostic['pre_gates'] = _pre_gates(payload)
+                diagnostic['trusted_endpoint_count'] = len(candidates)
             print('DRAFT_DIAGNOSTIC=' + json.dumps(diagnostic, sort_keys=True), flush=True)
         except Exception:
             pass
+
+    async def upload_progress(self):
+        """Report this native File's SDK percent; it never proves completion."""
+        if not self._current():
+            return None
+        try:
+            key=json.dumps(json.dumps(self.scope,separators=(',',':')))
+            value=await asyncio.wait_for(self.transport.evaluate(
+                '(async()=>{const s=window.__sauKSObserver;return s?.key==='+key+'&&!s.closed?await s.readProgress():null;})()'),45)
+            asset=self.session.assets.get('video',{})
+            if (not self._current() or not isinstance(value,dict) or
+                    any(value.get(k)!=asset.get(k) for k in ('name','size','sha256')) or
+                    value.get('sha256')!=self.session.expected.get('video_sha256') or
+                    type(value.get('percent')) not in (int,float) or not math.isfinite(value['percent']) or
+                    not 0<=value['percent']<=100):
+                return None
+            return value['percent']
+        except Exception:
+            return None
 
     async def drain(self):
         if not self._current():

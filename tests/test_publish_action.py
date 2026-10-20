@@ -154,7 +154,7 @@ class PublishActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.listeners["request"], [])
         self.assertEqual(page.listeners["response"], [])
 
-    async def test_xhs_success_route_is_a_current_submission_page_receipt(self):
+    async def test_xhs_success_route_without_current_native_post_is_unverified(self):
         frame = FakeFrame("https://creator.xiaohongshu.com/publish/publish")
         page = FakePage(frame)
 
@@ -166,8 +166,8 @@ class PublishActionTests(unittest.IsolatedAsyncioTestCase):
         with inspect_patch, locate_patch:
             result = await publish_action.publish_current(page, "xiaohongshu", receipt_timeout=0.01)
 
-        self.assertEqual(result["status"], publish_action.PUBLISHED_SUBMISSION_VERIFIED)
-        self.assertEqual(result["evidence"], {"kind": "success_page", "platform": "xiaohongshu"})
+        self.assertEqual(result["status"], publish_action.PUBLISHED_UNVERIFIED)
+        self.assertEqual(result["evidence"], {})
         self.assertEqual(button.clicks, 1)
 
     async def test_risk_and_unverified_login_block_without_releasing_guard(self):
@@ -328,3 +328,17 @@ class PublishActionTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class BilibiliWebContractTests(unittest.TestCase):
+    def test_exact_official_v3_endpoint_requires_archive_identity(self):
+        from uploader.draft_only import is_publish_request
+        endpoint='https://member.bilibili.com/x/vu/web/add/v3'
+        self.assertTrue(is_publish_request(endpoint,'POST'))
+        self.assertEqual(publish_action._documented_contract_url(endpoint),'bilibili_web')
+        self.assertFalse(is_publish_request('https://member.bilibili.com/x/vu/web/add/v2/advance','POST'))
+        valid={'code':0,'data':{'aid':123,'bvid':'BV1J7HS6hE52'}}
+        self.assertEqual(publish_action._extract_documented_id('bilibili_web',valid),'BV1J7HS6hE52')
+        for value in ({'code':1,'data':valid['data']},{'code':False,'data':valid['data']},
+                      {'code':0,'data':{'aid':True,'bvid':'BV1J7HS6hE52'}},
+                      {'code':0,'data':{'aid':123,'bvid':'guess'}},{'code':0,'data':{'bvid':'BV1J7HS6hE52'}}):
+            with self.subTest(value=value):self.assertIsNone(publish_action._extract_documented_id('bilibili_web',value))

@@ -41,7 +41,7 @@ PUBLISH_PATHS = tuple(re.compile(pattern) for pattern in (
     r'^/aweme/v1/co/item/publish/?$',
     r'^/rest/cp/works/v[23]/video/pc/(?:publish|(?:edit/|isolation/)?submit)/?$',
     r'^/openapi/photo/publish/?$',
-    r'^/x/vu/web/(?:add|edit)/?$',
+    r'^/x/vu/web/(?:add(?:/v3)?|edit)/?$',
     r'^/arcopen/fn/archive/add-by-utoken/?$',
     r'^/(?:cgi-bin/mmfinderassistant-bin/)?post/post_(?:create|update|publish)/?$',
     r'^/api/media/v1/note/(?:create|publish)/?$',
@@ -381,6 +381,9 @@ async def _ui_assets(page, candidate, *, video_only=False):
     if platform_id(getattr(getattr(page, '_sau_draft_evidence', None), 'platform', '')) == 'tencent' and not video_only:
         from uploader.tc_assets import tc_reopened_assets_match
         return await tc_reopened_assets_match(page, candidate)
+    if platform_id(getattr(getattr(page, '_sau_draft_evidence', None), 'platform', '')) == 'kuaishou':
+        from uploader.ks_reopened_assets import ks_reopened_assets_match
+        return False if video_only else await ks_reopened_assets_match(page, candidate)
     dy = platform_id(getattr(getattr(page, '_sau_draft_evidence', None), 'platform', '')) == 'douyin'
     video_seen, cover_seen = False, False
     if dy:
@@ -710,6 +713,10 @@ async def save_draft(page, platform, title, receipt_path=None, button_timeout=15
     expected = session.expected
     if str(title).strip() != str(expected.get('title', '')).strip():
         session.issues.append('title_argument_mismatch')
+    if expected.get('workflow_action') == 'publish':
+        from uploader.publication_workflow import publish_prepared
+        return await publish_prepared(page, p, expected=expected, receipt_path=receipt_path,
+                                      receipt_timeout=receipt_timeout)
     candidate, reopened, action = None, None, None
     checks, reasons, account_after = dict.fromkeys(CHECKS, False), [], {}
     attempted = False
@@ -810,15 +817,20 @@ async def save_draft(page, platform, title, receipt_path=None, button_timeout=15
                 finish_progress_operation('verify', 'response', 'completed')
                 verify_response_done = True
             if candidate and candidate.get('id') and candidate.get('fresh') and before_reopen and not session.issues and not attempted:
-                session.reopen_at = time.time()
-                attempted = True
                 start_progress_operation('verify', 'reopen')
                 if p == 'tencent' and not await session.tc_processing_observer.freeze_for_reopen(candidate):
                     finish_progress_operation('verify', 'reopen', 'failed')
                     session.issues.append('tc_processing_reopen_chain_not_verified')
                     break
+                session.reopen_at = time.time()
+                attempted = True
                 try:
                     reopened_ok = await _reopen(page, p, candidate)
+                    if p == 'tencent' and reopened_ok:
+                        # Processing/list waits consume their own finite budget;
+                        # allow response bytes and decoded native consumers to
+                        # finish after normal edit, without another save click.
+                        deadline = max(deadline, time.monotonic() + receipt_timeout)
                 except BaseException:
                     finish_progress_operation('verify', 'reopen', 'failed')
                     raise
@@ -839,7 +851,13 @@ async def save_draft(page, platform, title, receipt_path=None, button_timeout=15
                     checks, reasons = verify_evidence(p, expected, reopened or candidate, session.upload_links(), session.account,
                                                        reopened=reopened, ui_fields=ui_verified, account_after=account_after)
                 elif p == 'tencent':
-                    ui_fields, ui_assets, ui_verified = await _reopened_ui_gates(page, p, expected, candidate)
+                    from uploader.tc_reopen_mapping import verify_processing_reopen
+                    processing_mapping = await verify_processing_reopen(session, candidate, reopened, account_after)
+                    if processing_mapping is not None:
+                        ui_fields = await _ui_fields(page, p, expected)
+                        ui_assets, ui_verified = True, ui_fields
+                    else:
+                        ui_fields, ui_assets, ui_verified = await _reopened_ui_gates(page, p, expected, candidate)
                     try:
                         _tc_reopen_gate_diagnostic(session, candidate, reopened, expected, ui_fields, ui_assets,
                                                    account_after, tc_reopen_diagnostic_state)
@@ -847,7 +865,8 @@ async def save_draft(page, platform, title, receipt_path=None, button_timeout=15
                         # Diagnostics are observational only and never affect the verifier gate.
                         pass
                     checks, reasons = verify_evidence(p, expected, candidate, session.upload_links(), session.account,
-                                                       reopened=reopened, ui_fields=ui_verified, account_after=account_after)
+                                                       reopened=reopened, ui_fields=ui_verified, account_after=account_after,
+                                                       tc_processing_mapping=processing_mapping)
                 else:
                     checks, reasons = verify_evidence(p, expected, candidate, session.upload_links(), session.account,
                                                        reopened=reopened,

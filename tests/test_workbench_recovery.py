@@ -31,6 +31,18 @@ class LocalWorkbench(unittest.TestCase):
         for value in reversed(self.patches): value.stop()
         self.temp.cleanup()
 
+    def test_new_embedded_task_uses_fresh_verified_owner_without_rewriting_history(self):
+        wb.ACCOUNTS['embedded:douyin'] = {'account': {'identity': 'previous-owner'}, 'verified_at': 123}
+        before = json.loads(json.dumps(wb.ACCOUNTS))
+        with patch.object(wb, 'current_sessions', return_value={'douyin': {'status': 'login_verified', 'identity': 'live-owner'}}):
+            context = wb.account_context('douyin', 'embedded')
+        self.assertEqual(context['identity'], 'live-owner')
+        self.assertEqual(context['account_key'], 'embedded:douyin:live-owner')
+        self.assertEqual(wb.ACCOUNTS, before)
+        for session in ({}, {'douyin': {'status': 'needs_confirmation', 'identity': 'unverified-owner'}}):
+            with patch.object(wb, 'current_sessions', return_value=session):
+                self.assertEqual(wb.account_context('douyin', 'embedded')['identity'], 'previous-owner')
+
     def start(self, platforms=('douyin',), payload=None, action='draft'):
         with patch.object(wb.threading, 'Thread') as thread:
             job = wb.start_job({'action': action, 'platforms': list(platforms), 'payload': payload or self.payload})

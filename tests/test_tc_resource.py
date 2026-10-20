@@ -87,6 +87,21 @@ class TCResourceIdentityTests(unittest.TestCase):
         for key in ('encfilekey', 'uzid', 'bizid', 'hy', 'idx'):
             self.assertIsNone(tc_resource_identity(resource(dict(ENCRYPTED, **{key: ''}))))
 
+    def test_processed_scene_family_keeps_every_opaque_field_and_distinct_identity(self):
+        fields={'encfilekey':'scene-resource','m':'','uzid':'scene-id','hy':'SZ','idx':'1',
+                'scene':'1','basedata':'scene-context'}
+        identity=tc_resource_identity(resource(fields))
+        self.assertIsNotNone(identity)
+        self.assertNotEqual(identity,tc_resource_identity(resource()))
+        for key in fields:
+            with self.subTest(key=key):
+                changed={**fields,key:fields[key]+'changed'}
+                self.assertNotEqual(identity,tc_resource_identity(resource(changed)))
+                missing=dict(fields);del missing[key]
+                self.assertIsNone(tc_resource_identity(resource(missing)))
+        self.assertIsNone(tc_resource_identity(resource(dict(fields,extra='unknown'))))
+        self.assertEqual(identity,tc_resource_identity(resource(dict(fields,token='rotated-auth'))))
+
     def test_older_official_filekey_storeid_family_is_separate(self):
         result = tc_resource_identity(resource(PLAIN, path=PLAIN_PATH))
         self.assertIsNotNone(result)
@@ -94,12 +109,46 @@ class TCResourceIdentityTests(unittest.TestCase):
             PLAIN, origin='http://wxapp.tc.qq.com', path=PLAIN_PATH)))
         self.assertNotEqual(result, tc_resource_identity(resource()))
         self.assertIsNone(tc_resource_identity(resource(PLAIN)))
-        self.assertIsNone(tc_resource_identity(resource(path=PLAIN_PATH)))
+        self.assertNotEqual(tc_resource_identity(resource(path=PLAIN_PATH)), tc_resource_identity(resource()))
         self.assertIsNone(tc_resource_identity(resource(dict(PLAIN, m=''), path=PLAIN_PATH)))
         for key in ('filekey', 'storeid'):
             changed = dict(PLAIN)
             changed[key] += '-B'
             self.assertNotEqual(result, tc_resource_identity(resource(changed, path=PLAIN_PATH)))
+
+    def test_native_uploaded_image_shape_is_path_sensitive_and_keeps_all_opaque_fields(self):
+        fields=dict(ENCRYPTED)
+        image=image_resource(fields)
+        identity=tc_resource_identity(image)
+        self.assertRegex(identity,r'^tc-resource:[0-9a-f]{64}$')
+        self.assertEqual(identity,tc_resource_identity(image_resource(dict(reversed(list(fields.items()))),origin='http://wxapp.tc.qq.com')))
+        self.assertEqual(identity,tc_resource_identity(image_resource(dict(fields,token='rotated',sign='rotated-sign'))))
+        self.assertNotEqual(identity,tc_resource_identity(resource(fields)))
+        self.assertNotEqual(identity,tc_resource_identity(image_resource(IMAGE_COVER)))
+        for key in fields:
+            with self.subTest(key=key):
+                changed={**fields,key:fields[key]+'different'}
+                self.assertNotEqual(identity,tc_resource_identity(image_resource(changed)))
+                missing=dict(fields);del missing[key]
+                self.assertIsNone(tc_resource_identity(image_resource(missing)))
+        for changed in (dict(fields,picformat='123'),dict(fields,basedata='extra'),dict(fields,filekey='other'),
+                dict(fields,storeid='other'),dict(fields,unknown='other')):
+            self.assertIsNone(tc_resource_identity(image_resource(changed)))
+        for path in ('/251/20304/stodownload/','/251/20305/stodownload','/20304/stodownload'):
+            self.assertIsNone(tc_resource_identity(resource(fields,path=path)))
+        self.assertIsNone(tc_resource_identity(image+'&scene=duplicate'))
+        self.assertIsNone(tc_resource_identity(image.replace('encfilekey=','%65ncfilekey=')))
+
+    def test_native_uploaded_covers_http_finish_and_saved_slots_share_one_canonical_id(self):
+        from uploader.draft_evidence import _tc_resource_aliases
+        portrait=image_resource(ENCRYPTED)
+        landscape=image_resource(dict(ENCRYPTED,encfilekey='different-landscape',uzid='different-image'))
+        parsed=parse_record('tencent',{'objectId':'fixture-id','postReq':{'objectDesc':{
+            'description':'fixture caption','media':[{'url':resource(),'coverUrl':portrait,'shareCoverUrl':landscape,'thumbUrl':portrait}]}}})
+        for slot,url in (('cover_portrait',portrait),('cover_landscape',landscape)):
+            self.assertEqual(parsed['cover_slots'][slot],_tc_resource_aliases(url))
+            self.assertEqual(parsed['cover_slots'][slot],_tc_resource_aliases(url.replace('https://finder.video.qq.com','http://wxapp.tc.qq.com')))
+            self.assertEqual(len(parsed['cover_slots'][slot]),1)
 
     def test_official_image_cover_and_thumbnail_shapes_are_supported(self):
         for fields in (IMAGE_COVER, IMAGE_THUMBNAIL):

@@ -14,7 +14,10 @@ on:
         default: ''
       tag:
         description: Exact draft release tag
-        default: v1.6.1
+        default: ''
+concurrency:
+  group: native-release-${{ github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: write
   actions: read
@@ -77,7 +80,7 @@ jobs:
           npm ci --prefix desktop --no-audit --no-fund
       - name: Validate shared and native helpers
         run: |
-          node --test tests/*.test.cjs tests/test_backend_health.cjs
+          node --test --test-concurrency=1 tests/*.test.cjs tests/test_backend_health.cjs
           python -m unittest tests.test_runtime_support tests.test_platform_limits tests.test_workbench_progress tests.test_fine_progress tests.test_media_preview tests.test_frame_capture
       - name: Build self-contained application
         run: |
@@ -93,12 +96,14 @@ jobs:
           Push-Location desktop
           npx electron-builder --prepackaged "../dist/发布助手-win32-x64" --win nsis --x64 --publish never
           Pop-Location
-          7z a "release-assets/Publish-Assistant-1.6.1-Windows-x64.zip" "dist/发布助手-win32-x64/*"
+          $version = (Get-Content desktop/package.json -Raw | ConvertFrom-Json).version
+          7z a "release-assets/Publish-Assistant-$version-Windows-x64.zip" "dist/发布助手-win32-x64/*"
           python scripts/release_checksums.py
       - name: Validate installed Windows application
         shell: pwsh
         run: |
-          $installer = Resolve-Path "release-assets/Publish-Assistant-1.6.1-Windows-x64-Setup.exe"
+          $version = (Get-Content desktop/package.json -Raw | ConvertFrom-Json).version
+          $installer = Resolve-Path "release-assets/Publish-Assistant-$version-Windows-x64-Setup.exe"
           $destination = Join-Path $env:RUNNER_TEMP 'PublishAssistant-Installed'
           $process = Start-Process -FilePath $installer -ArgumentList @('/S',"/D=$destination") -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw 'Installer failed' }
@@ -121,8 +126,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
+          $version = (Get-Content desktop/package.json -Raw | ConvertFrom-Json).version
           $release = gh release view $env:RELEASE_TAG --json isDraft,targetCommitish | ConvertFrom-Json
-          if (-not $release.isDraft -or $env:RELEASE_TAG -ne 'v1.6.1' -or $release.targetCommitish -ne $env:GITHUB_SHA) { throw 'Exact draft Release and source commit required' }
+          if (-not $release.isDraft -or $env:RELEASE_TAG -ne "v$version" -or $release.targetCommitish -ne $env:GITHUB_SHA) { throw 'Exact draft Release and source commit required' }
           $assets = Get-ChildItem release-assets -File | Where-Object { $_.Extension -in '.exe','.zip' -or $_.Name -match 'validation.json|SHA256SUMS-Windows.txt' }
           gh release upload $env:RELEASE_TAG @($assets.FullName) --clobber
           if ($LASTEXITCODE) { throw 'Upload failed' }

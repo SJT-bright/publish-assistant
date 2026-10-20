@@ -587,6 +587,42 @@ class TCCoverObserver:
         value = next(iter(resources.values()), None) if len(resources) == 1 else None
         return list(value) if value else []
 
+    def freeze_records(self, candidate, links):
+        """Preserve only verified original→crop→upload records for saved roles."""
+        import copy
+        if not self._current():
+            return None
+        output = {}
+        for slot, asset in self.scope['covers'].items():
+            ids = candidate.get('cover_slots', {}).get(slot, [])
+            if not isinstance(ids, list) or len(ids) != 1 or not isinstance(ids[0], str) or not ids[0]:
+                return None
+            matches = [record for record in self.records.values() if record['slot'] == slot and
+                record['origin_sha256'] == asset['sha256'] and ids[0] in self._resources(record) and
+                record['selected_at'] >= self.invalidated.get(slot, 0)]
+            if len(matches) != 1:
+                return None
+            record = matches[0]
+            chain_ids = self._resources(record)
+            valid = [link for link in self.upload_links() if link['sha256'] == asset['sha256'] and link['ids'] == chain_ids and link in links]
+            if len(valid) != 1:
+                return None
+            output[slot] = {'record': copy.deepcopy(record), 'ids': list(ids), 'chain_ids': list(chain_ids), 'link': copy.deepcopy(valid[0])}
+        return output
+
+    def frozen_current(self, frozen):
+        try:
+            current = self.upload_links()
+            return (self._current() and isinstance(frozen, dict) and set(frozen) == set(self.scope['covers']) and
+                all(value['record'] == self.records.get(value['record']['invocation_id']) and
+                    value['record']['selected_at'] >= self.invalidated.get(slot, 0) and
+                    len(value['ids']) == 1 and value['ids'][0] in value['chain_ids'] and
+                    self._resources(value['record']) == value['chain_ids'] and
+                    value['link']['ids'] == value['chain_ids'] and value['link'] in current
+                    for slot, value in frozen.items()))
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return False
+
     def upload_links(self):
         if not self._current():
             return []

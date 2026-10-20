@@ -8,6 +8,8 @@ import hashlib
 import hmac
 import io
 import json
+import shutil
+import subprocess
 import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stdout
@@ -426,6 +428,7 @@ class CheckpointFixtureTests(unittest.IsolatedAsyncioTestCase):
         # Real native SDK/realm observers have their own browser fixtures;
         # the intentionally browser-free Page cannot initialize those APIs.
         observers = {
+            'douyin': ('uploader.dy_evidence.install_dy_observer',),
             'xiaohongshu': ('uploader.xhs_evidence.install_xhs_observer',),
             'tencent': ('uploader.tc_cover_evidence.install_tc_cover_observer',
                         'uploader.tc_processing.install_tc_processing_observer'),
@@ -1157,13 +1160,25 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
             request = route.request
             path = urlparse(request.url).path
             self.calls.append((request.method, path))
+            if path.startswith('/fixture-media/'):
+                if path.endswith('.mp4'):
+                    await route.fulfill(content_type='video/mp4', body=self.video.read_bytes())
+                else:
+                    await route.fulfill(content_type='image/png', body=self.decoded_png)
+                return
+            if path == '/rest/cp/works/v2/video/pc/upload/cover/view':
+                await route.fulfill(content_type='image/png', body=self.decoded_png)
+                return
             if path in ('/upload/video', '/upload/image', '/upload/pre', '/upload/finish'):
                 if path == '/upload/pre':
                     data = {'code': 0, 'data': {'fileId': 'allocated-video'}}
                 elif path == '/upload/finish':
                     data = {'code': 0, 'data': {'fileId': 'allocated-video', 'complete': True}}
                 else:
-                    data = {'code': 0, 'data': {'vid': 'new-video' if path == '/upload/video' else 'new-cover', 'complete': True}}
+                    from urllib.parse import parse_qs
+                    slot = parse_qs(urlparse(request.url).query).get('slot', [''])[0]
+                    resource = 'new-video' if path == '/upload/video' else ('new-cover-' + slot if slot else 'new-cover')
+                    data = {'code': 0, 'data': {'vid': resource, 'complete': True}}
                 await route.fulfill(content_type='application/json', body=json.dumps(data))
             elif path.endswith('/publishInfo/snapshot/save'):
                 self.snapshot = request.post_data_json
@@ -1172,7 +1187,9 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 snapshot = dict(self.snapshot or {})
                 if self.read_wrong_id:
                     snapshot['fileId'] = 'old-video'
-                await route.fulfill(content_type='application/json', body=json.dumps({'result': 1, 'data': snapshot}))
+                if snapshot:
+                    snapshot.update(url='https://fixture.invalid/fixture-media/new-video.mp4')
+                await route.fulfill(content_type='application/json', body=json.dumps({'result': 1, 'data': snapshot, 'currentTime': 1792000000000}))
             else:
                 await route.fulfill(content_type='text/html', body=self.html)
         await self.context.route('**/*', serve)
@@ -1183,6 +1200,19 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
         await self.browser.close()
         await self.playwright.stop()
         self.directory.cleanup()
+
+    async def decoded_assets(self):
+        from tests.test_dy_cover_readback import TINY_PNG
+        ffmpeg = shutil.which('ffmpeg')
+        if not ffmpeg:
+            self.skipTest('ffmpeg unavailable for actual decoded-media fixture')
+        if not hasattr(type(self), '_decoded_mp4'):
+            type(self)._decoded_mp4 = subprocess.check_output([ffmpeg, '-v', 'error', '-f', 'lavfi', '-i',
+                'color=c=blue:s=320x180:r=10:d=1', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-movflags', 'frag_keyframe+empty_moov', '-f', 'mp4', 'pipe:1'])
+        self.video.write_bytes(type(self)._decoded_mp4)
+        self.cover.write_bytes(TINY_PNG)
+        self.decoded_png = TINY_PNG
 
     def expected(self, platform='douyin', custom_cover=False):
         payload = {'video': str(self.video), 'title': '重复标题', 'description': '完整正文', 'tags': ['话题']}
@@ -1195,43 +1225,67 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
         return expected
 
     async def setup_dy(self, *, old_media=False, restored_media=True, custom_cover=False, consume_cache=False):
+        await self.decoded_assets()
         expected = self.expected(custom_cover=custom_cover)
         config = json.dumps({'title': expected['title'], 'caption': expected['platform_fields']['caption'],
                              'media': 'old-video' if old_media else 'new-video',
-                             'cover': 'new-cover' if custom_cover else 'default-cover', 'restoredMedia': restored_media,
-                             'consumeCache': consume_cache})
-        self.html = '''<!doctype html><meta charset="utf-8">
-          <div data-user-id="fixture-owner">本地测试账号</div>
+                             'portrait': 'new-cover-portrait' if custom_cover else 'default-cover-portrait',
+                             'landscape': 'new-cover-landscape' if custom_cover else 'default-cover-landscape',
+                             'restoredMedia': restored_media, 'consumeCache': consume_cache})
+        self.html = r'''<!doctype html><meta charset="utf-8"><style>
+          #root{width:800px}video{display:block;width:320px;height:180px}
+          .coverControl-fixture{display:inline-block;width:160px;height:135px}
+          .coverControl-fixture img{display:block;width:100px;height:100px}
+          </style><div data-user-id="fixture-owner">本地测试账号</div>
           <input id="video" type="file" accept="video/mp4"><input id="cover" type="file" accept="image/png">
-          <div id="editor"><input id="title" placeholder="填写作品标题"><div id="body" contenteditable="true"></div>
+          <div id="root"><div id="editor"><input id="title" placeholder="填写作品标题"><div id="body" contenteditable="true"></div>
             <div id="media" data-video-id="" style="width:100px;height:30px">视频预览</div>
-            <div id="preview" data-cover-id="" style="width:100px;height:30px">封面预览</div></div>
-          <button id="save">暂存离开</button><button id="restore" style="display:none">继续编辑</button>
+            <video id="nativeVideo" src="https://fixture.invalid/fixture-media/new-video.mp4" preload="auto"></video>
+            <div id="portraitCard" class="coverControl-fixture"><span>竖封面3:4</span><img src="https://fixture.invalid/fixture-media/portrait.png"></div>
+            <div id="landscapeCard" class="coverControl-fixture"><span>横封面4:3</span><img src="https://fixture.invalid/fixture-media/landscape.png"></div>
+          </div></div><button id="save">暂存离开</button><button id="restore" style="display:none">继续编辑</button>
           <div id="toast"></div><button id="coverToast">保存封面</button>
-          <button id="publish" onclick="window.publishClicked=true">继续发布</button>
-          <script>
+          <button id="publish" onclick="window.publishClicked=true">继续发布</button><script>
           const cfg=CONFIG;
           window.title.value=cfg.title;window.body.innerText=cfg.caption;
-          window.video.addEventListener('change',async()=>{let f=window.video.files[0];
+          const root={tag:3,child:null},fiberRoot={current:root,containerInfo:document.querySelector('#root')};root.stateNode=fiberRoot;
+          document.querySelector('#root').__reactContainer$fixture={tag:3,stateNode:fiberRoot};
+          const player={tag:0,memoizedProps:{currentVideo:{vid:'new-video'},width:320,height:180,playUrl:window.nativeVideo.src},
+             child:{tag:5,stateNode:window.nativeVideo}};root.child=player;
+          const cards=[];
+          for(const [id,uri] of [['portraitCard',cfg.portrait],['landscapeCard',cfg.landscape]]){
+            const el=document.getElementById(id),img=el.querySelector('img');
+            const imageHost={tag:5,stateNode:img,memoizedProps:{src:img.src}},imageComponent={tag:0,memoizedProps:{src:img.src},child:imageHost};
+            const card={tag:0,memoizedProps:{coverInfo:{uri},disabled:false,handleEditCover(){},durationStr:'00:01',showOperation:true,className:'cover-card'},
+               child:{tag:5,stateNode:el,child:imageComponent}};
+            (cards.length?cards[cards.length-1]:player).sibling=card;cards.push(card);
+          }
+          window.fixture={player,cards,root,fiberRoot};
+          window.video.addEventListener('change',async()=>{const f=window.video.files[0];
              await fetch('/upload/video',{method:'POST',body:JSON.stringify({fileName:f.name,fileSize:f.size})});});
-          window.cover.addEventListener('change',async()=>{let f=window.cover.files[0];
-             await fetch('/upload/image?name='+encodeURIComponent(f.name)+'&size='+f.size,{method:'POST',body:f});});
+          window.cover.addEventListener('change',async()=>{const f=window.cover.files[0];
+             for(const slot of ['portrait','landscape'])await fetch('/upload/image?slot='+slot+'&name='+encodeURIComponent(f.name)+'&size='+f.size,{method:'POST',body:f});});
           window.coverToast.onclick=()=>window.toast.innerText='封面保存成功';
           window.save.onclick=()=>{
-            const draft={cache:{itemTitle:cfg.title,textResult:{text:cfg.caption},longFileInfo:{vid:cfg.media,coverUri:cfg.cover},coverInfo:{uri:cfg.cover},coverHorizontalInfo:{uri:cfg.cover}}};
+            const draft={cache:{itemTitle:window.title.value,textResult:{text:window.body.innerText},longFileInfo:{vid:cfg.media,coverUri:cfg.portrait},
+               coverInfo:{uri:cfg.portrait},coverHorizontalInfo:{uri:cfg.landscape}}};
             localStorage.setItem('publish_form_cache:fixture-owner',JSON.stringify(draft));
             window.editor.style.display='none';window.restore.style.display='block';window.toast.innerText='已保存';
+            history.replaceState(null,'','/creator-micro/content/upload');
           };
           window.restore.onclick=()=>{
             const stored=JSON.parse(localStorage.getItem('publish_form_cache:fixture-owner')).cache;
             if(cfg.consumeCache)localStorage.setItem('publish_form_cache:fixture-owner','null');
             window.title.value=stored.itemTitle;window.body.innerText=stored.textResult.text;
             window.media.dataset.videoId=cfg.restoredMedia?stored.longFileInfo.vid:'wrong-visible-video';
-            window.preview.dataset.coverId=stored.coverInfo.uri;
+            player.memoizedProps.currentVideo={vid:window.media.dataset.videoId};
+            cards[0].memoizedProps.coverInfo={uri:stored.coverInfo.uri};cards[1].memoizedProps.coverInfo={uri:stored.coverHorizontalInfo.uri};
             window.editor.style.display='block';window.restore.style.display='none';
+            history.replaceState(null,'','/creator-micro/content/post/video');
           };
           </script>'''.replace('CONFIG', config)
-        await self.page.goto('http://127.0.0.1:45997/creator-micro/content/upload')
+        await self.page.goto('https://creator.douyin.com/creator-micro/content/post/video')
+        await self.page.wait_for_function("nativeVideo.readyState>=2&&nativeVideo.videoWidth>0&&[...document.querySelectorAll('img')].every(i=>i.complete&&i.naturalWidth>0)")
         session = await begin_draft_verification(self.page, 'douyin', expected, account_reader=lambda: account())
         await self.page.locator('#video').set_input_files(str(self.video))
         if custom_cover:
@@ -1422,14 +1476,17 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
         expected, old = await self.setup_dy()
         # The fulfilled upload response has already been independently bound to
         # this native File. The fixture UI now presents that same resource.
-        await self.page.evaluate("window.media.dataset.videoId='new-video';window.preview.dataset.coverId='default-cover'", isolated_context=False)
+        await self.page.evaluate("window.fixture.player.memoizedProps.currentVideo.vid='new-video'", isolated_context=False)
         await self.page.locator('#body').fill('')
         checkpoint = await old.export_checkpoint(seal_key=bytes(range(32)))
         await end_draft_verification(self.page)
         fresh = await begin_draft_verification(self.page, 'douyin', expected, account_reader=lambda: account())
         async def current_media(page, platform):
+            from uploader.dy_reopen import read_dy_visible_video
             self.assertEqual(platform, 'douyin')
-            return await page.evaluate("({source:'platform_composer',video_count:document.querySelectorAll('#media[data-video-id]:not([data-video-id=\"\"])').length,video_ids:[window.media.dataset.videoId]})", isolated_context=False)
+            observed = await read_dy_visible_video(page, ['new-video'])
+            return {'source': 'platform_composer', 'video_count': observed['video_count'],
+                    'video_ids': observed['video_ids']} if observed else None
         restored = await fresh.restore_checkpoint(checkpoint, seal_key=bytes(range(32)), media_reader=current_media)
         self.assertTrue(restored['video_upload_verified'])
         self.assertEqual(fresh.files, [])
@@ -1459,6 +1516,17 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
         persisted = await self.page.evaluate("JSON.parse(localStorage.getItem('publish_form_cache:fixture-owner'))")
         self.assertEqual(persisted['cache']['longFileInfo']['vid'], 'new-video')
         self.assertEqual(sum(path == '/upload/video' for _, path in self.calls), 1)
+
+    async def test_loaded_dy_cover_with_wrong_current_uri_cannot_verify_reopen(self):
+        expected, _ = await self.setup_dy(custom_cover=True)
+        await self.page.evaluate("restore.addEventListener('click',()=>{fixture.cards[1].memoizedProps.coverInfo.uri='wrong-current-cover';})", isolated_context=False)
+        result = await save_draft(self.page, '抖音', expected['title'], button_timeout=.2, receipt_timeout=1, expected=expected)
+        self.assertEqual(result['status'], 'saved_unverified')
+        self.assertTrue(result['verification']['upload_complete'])
+        self.assertTrue(result['verification']['cover'])
+        self.assertTrue(result['verification']['account'])
+        self.assertFalse(result['verification']['reopened'])
+        self.assertTrue(await self.page.locator('#landscapeCard img').evaluate('img=>img.complete&&img.naturalWidth>0'))
 
     async def test_cover_toast_and_late_observer_never_become_verified(self):
         self.html = '<button onclick="document.body.append(\'封面保存成功\')">保存草稿</button>'
@@ -1504,18 +1572,20 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed['video_ids'], ['v-current'])
 
     async def test_xhs_exact_video_draft_id_edit_does_not_select_duplicate_title(self):
+        await self.decoded_assets()
         expected = self.expected('xiaohongshu')
         config = json.dumps(expected['platform_fields'])
-        self.html = '''<!doctype html><meta charset="utf-8">
+        self.html = r'''<!doctype html><meta charset="utf-8">
           <input id="video" type="file" accept="video/mp4"><div id="editor">
           <input id="title" placeholder="填写标题"><div id="body" contenteditable="true"></div>
-          <div id="media" data-video-id="" style="width:100px;height:30px">视频预览</div>
-          <div id="preview" data-cover-id="" style="width:100px;height:30px">封面预览</div></div>
-          <button id="save">暂存离开</button><div id="drawer" style="display:none">
-            <div class="draft-item" data-draft-id="old-id" data-draft-type="video">重复标题<div class="btn" onclick="window.wrongDraft=true">编辑</div></div>
-            <div class="draft-item" data-draft-id="new-id" data-draft-type="video">重复标题<div class="btn" id="edit">编辑</div></div>
+          <video id="media" src="https://fixture.invalid/fixture-media/new-video/preview.mp4" style="width:320px;height:180px" preload="auto"></video>
+          <img id="preview" src="https://fixture.invalid/fixture-media/default-cover/display.png" style="width:100px;height:100px"></div>
+          <button id="save">暂存离开</button><div id="drawer" class="draft-drawer" style="display:none;width:400px;height:200px">
+            <div class="draft-item" data-draft-id="old-id" data-draft-type="video">重复标题<div class="draft-actions"><div class="btn" onclick="window.wrongDraft=true">编辑</div></div></div>
+            <div class="draft-item" data-draft-id="new-id" data-draft-type="video">重复标题<div class="draft-actions"><div class="btn" id="edit">编辑</div></div></div>
           </div><script>
-          const cfg=CONFIG;window.title.value=cfg.title;window.body.innerText=cfg.description+'\\n'+cfg.tags.map(t=>'#'+t).join(' ');
+          const cfg=CONFIG;window.title.value=cfg.title;window.body.innerText=cfg.description+'\n'+cfg.tags.map(t=>'#'+t).join(' ');
+          window._tiptap_editor={view:{dom:window.body,docView:{children:[]}}};
           const dbPromise=new Promise(resolve=>{const r=indexedDB.open('draft-database-v1',1);
              r.onupgradeneeded=()=>r.result.createObjectStore('video-draft',{keyPath:'draftId'});r.onsuccess=()=>resolve(r.result);});
           window.video.onchange=async()=>{const f=window.video.files[0];await fetch('/upload/video',{method:'POST',body:JSON.stringify({fileName:f.name,fileSize:f.size})});};
@@ -1525,10 +1595,12 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
              tx.oncomplete=()=>{window.editor.style.display='none';window.drawer.style.display='block';};};
           window.edit.onclick=async()=>{const db=await dbPromise,tx=db.transaction('video-draft','readonly'),r=tx.objectStore('video-draft').get('new-id');
              r.onsuccess=()=>{const stored=r.result.content.draftStore;window.title.value=stored.title;window.body.innerText=stored.desc;
-                window.media.dataset.videoId=stored.video.fileid;window.preview.dataset.coverId=stored.cover.fileid;
+                window.media.src='https://fixture.invalid/fixture-media/'+stored.video.fileid+'/preview.mp4';
+                window.preview.src='https://fixture.invalid/fixture-media/'+stored.cover.fileid+'/display.png';
                 window.editor.style.display='block';window.drawer.style.display='none';};};
           </script>'''.replace('CONFIG', config)
-        await self.page.goto('http://127.0.0.1:45997/publish/publish?target=video')
+        await self.page.goto('https://creator.xiaohongshu.com/publish/publish?target=video')
+        await self.page.wait_for_function("media.readyState>=2&&media.videoWidth>0&&preview.complete&&preview.naturalWidth>0")
         session = await begin_draft_verification(self.page, 'xiaohongshu', expected, account_reader=lambda: account('xiaohongshu'))
         await self.page.locator('#video').set_input_files(str(self.video))
         await self.wait_fingerprints(session, 1)
@@ -1539,23 +1611,54 @@ class BrowserEvidenceTests(unittest.IsolatedAsyncioTestCase):
         validate_receipt(result, expected, 'xiaohongshu')
 
     async def setup_ks(self):
-        expected = self.expected('kuaishou')
+        await self.decoded_assets()
+        expected = self.expected('kuaishou', custom_cover=True)
         config = json.dumps({'caption': expected['platform_fields']['caption']})
-        self.html = '''<!doctype html><meta charset="utf-8">
-          <input id="video" type="file" accept="video/mp4"><div id="body" contenteditable="true"></div>
-          <div id="media" data-video-id="" style="width:100px;height:30px">视频</div>
-          <div id="cover" data-cover-id="" style="width:100px;height:30px">封面</div>
+        self.html = r'''<!doctype html><meta charset="utf-8"><style>
+          #preview-tours{width:400px;height:210px}video{width:320px;height:180px}
+          #coverEditor img{display:block;width:100px;height:100px}
+          </style><input id="video" type="file" accept="video/mp4"><input id="coverInput" type="file" accept="image/png">
+          <div id="body" contenteditable="true"></div><div id="root"><div id="editor">
+          <main id="preview-tours"><video id="nativeVideo" preload="auto"></video></main>
+          <section id="coverEditor"><img id="nativeCover"></section></div></div>
           <button id="restore">继续编辑</button><script>
           const cfg=CONFIG;window.body.innerText=cfg.caption;
-          window.video.onchange=async()=>{const f=window.video.files[0];await fetch('/upload/video',{method:'POST',body:JSON.stringify({fileName:f.name,fileSize:f.size})});
-            await fetch('/rest/cp/works/v3/video/pc/publishInfo/snapshot/save',{method:'POST',body:JSON.stringify({fileId:'new-video',caption:cfg.caption,coverKey:'default-cover'})});};
+          const form={fileId:-1,coverKey:'',pkCoverKey:'',profileCoverKey:'',caption:cfg.caption,fileName:'',fileSize:'',url:''};
+          const progress={status:2,percent:0,localFileData:null};
+          const root={tag:3,child:null},fiberRoot={current:root,containerInfo:document.querySelector('#root')};root.stateNode=fiberRoot;
+          document.querySelector('#root').__reactContainer$fixture={tag:3,stateNode:fiberRoot};
+          const make=(parent,props,state=null,node=null)=>({return:parent,memoizedProps:props,memoizedState:state,stateNode:node,child:null,sibling:null});
+          const owner=make(root,{}, {memoizedState:{current:form},next:{memoizedState:progress,next:null}});root.child=owner;
+          const vp={url:'',coverUrl:'',captionStr:cfg.caption,coPublishUser:[],hasVideoComposite:false};
+          const consumer=make(owner,vp),vf=make(consumer,{src:''},null,window.nativeVideo);owner.child=consumer;consumer.child=vf;window.nativeVideo.__reactFiber$fixture=vf;
+          const ep={snapshotInfo:form,fileId:'',uploadFinish:true,coverUrl:'',pkUrl:'',profileUrl:'',supportProfileCover:true,onSaveCover(){}};
+          const coverOwner=make(owner,ep),imf=make(coverOwner,{src:''},null,window.nativeCover);consumer.sibling=coverOwner;coverOwner.child=imf;window.nativeCover.__reactFiber$fixture=imf;
+          window.fixture={form,progress,root,fiberRoot,owner,vp,ep,vf,imf};
+          let videoDone=false,coverDone=false,saved=false;
+          async function maybeSave(){if(!videoDone||!coverDone||saved)return;saved=true;
+            const snapshot={...form};delete snapshot.url;
+            await fetch('/rest/cp/works/v3/video/pc/publishInfo/snapshot/save',{method:'POST',body:JSON.stringify(snapshot)});
+          }
+          window.video.onchange=async()=>{const f=window.video.files[0];progress.localFileData=f;
+            const response=await fetch('/upload/video',{method:'POST',body:JSON.stringify({fileName:f.name,fileSize:f.size})});
+            const r=await response.json();form.fileId=r.data.vid;form.fileName=f.name;form.fileSize=String(f.size);progress.status=3;
+            videoDone=true;await maybeSave();};
+          window.coverInput.onchange=async()=>{const f=window.coverInput.files[0];
+            const r=await fetch('/upload/image?name='+encodeURIComponent(f.name)+'&size='+f.size,{method:'POST',body:f}).then(r=>r.json());
+            form.coverKey=r.data.vid;coverDone=true;await maybeSave();};
           const snapshotPromise=fetch('/rest/cp/works/v3/video/pc/snapshot/info',{method:'POST',body:'{}'}).then(r=>r.json());
-          window.restore.onclick=async()=>{const r=await snapshotPromise;window.body.innerText=r.data.caption||'';window.media.dataset.videoId=r.data.fileId||'';window.cover.dataset.coverId=r.data.coverKey||'';};
+          window.restore.onclick=async()=>{const r=await snapshotPromise;if(!r.data.fileId)return;
+            Object.assign(form,r.data);progress.status=3;progress.localFileData=null;window.body.innerText=form.caption;
+            vp.url=form.url;vf.memoizedProps.src=form.url;window.nativeVideo.src=form.url;ep.fileId=String(form.fileId);
+            const image=await fetch('/rest/cp/works/v2/video/pc/upload/cover/view?coverKey='+encodeURIComponent(form.coverKey)+'&_t='+Date.now()).then(r=>r.blob());
+            const coverUrl=URL.createObjectURL(image);vp.coverUrl=coverUrl;ep.coverUrl=coverUrl;imf.memoizedProps.src=coverUrl;window.nativeCover.src=coverUrl;
+          };
           </script>'''.replace('CONFIG', config)
-        await self.page.goto('http://127.0.0.1:45997/article/publish/video')
+        await self.page.goto('https://cp.kuaishou.com/article/publish/video')
         session = await begin_draft_verification(self.page, 'kuaishou', expected, account_reader=lambda: account('kuaishou'))
         await self.page.locator('#video').set_input_files(str(self.video))
-        await self.wait_fingerprints(session, 1)
+        await self.page.locator('#coverInput').set_input_files(str(self.cover))
+        await self.wait_fingerprints(session, 2)
         return expected, session
 
     async def test_server_snapshot_save_and_normal_reload_read_same_id_verified(self):

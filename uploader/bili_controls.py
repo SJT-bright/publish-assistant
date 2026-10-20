@@ -245,10 +245,16 @@ _EDITOR_OBJECT_JS = r"""
   if(publishers.size!==1)return null;const publisher=[...publishers][0];
   if(publisher.$taskConfig!==manager||publisher.$recordConfig!==record||publisher.videoTasks.length!==1||manager.tasks.length!==1)return null;
   const parent=manager.tasks[0],tasks=publisher.videoTasks,task=tasks[0],file=task.file,sdk=task.uploader,inner=sdk?.uploader;
-  if(parent.videoTasks!==tasks||parent.id!==manager.currentTaskId||publisher.id!==manager.currentTaskId||task.status!==3||
-     !sdk||sdk.file!==file||!inner||inner.file!==file||inner.completed!==true||!['stdSlice','slice'].includes(sdk.uploaderType)||
-     !/^[1-9][0-9]{0,19}$/.test(String(task.cid))||String(sdk.cid)!==String(task.cid)||typeof task.filename!=='string'||
-     !task.filename||task.filename.length>2048||/[\s\x00-\x1f\x7f]/.test(task.filename)||sdk.filename!==task.filename)return null;
+  if(parent.videoTasks!==tasks||parent.id!==manager.currentTaskId||publisher.id!==manager.currentTaskId)return null;
+  // Importing owns the same native File/task before server IDs exist. This
+  // mode authorizes content controls only; uploaded remains the final gate.
+  if(mode==='importing'){
+   if(!Number.isInteger(task.status)||task.status<0||task.status>3||
+      input.files.length!==1||input.files[0]!==file||sdk&&sdk.file!==file||inner&&inner.file!==file)return null;
+  }else if(task.status!==3||!sdk||sdk.file!==file||!inner||inner.file!==file||inner.completed!==true||
+     !['stdSlice','slice'].includes(sdk.uploaderType)||!/^[1-9][0-9]{0,19}$/.test(String(task.cid))||
+     String(sdk.cid)!==String(task.cid)||typeof task.filename!=='string'||!task.filename||task.filename.length>2048||
+     /[\s\x00-\x1f\x7f]/.test(task.filename)||sdk.filename!==task.filename)return null;
   const name=Reflect.apply(Object.getOwnPropertyDescriptor(File.prototype,'name').get,file,[]),
    size=Reflect.apply(Object.getOwnPropertyDescriptor(Blob.prototype,'size').get,file,[]),
    type=Reflect.apply(Object.getOwnPropertyDescriptor(Blob.prototype,'type').get,file,[]);
@@ -258,6 +264,7 @@ _EDITOR_OBJECT_JS = r"""
 """.replace('VIDEO_SELECTOR', VIDEO_INPUT)
 
 _EDITOR_REFS = ('document','manager','record','input','publisher','parent','tasks','task','file','sdk','inner','cid','filename')
+_EDITOR_TASK_REFS = ('document','manager','record','input','publisher','parent','tasks','task','file')
 
 _REOPENED_MEDIA = r"""() => {
  try{
@@ -334,7 +341,7 @@ async def bili_empty_video_control(page):
     return frame.locator(VIDEO_INPUT)
 
 
-async def bili_wait_uploaded(page, timeout=600):
+async def bili_wait_uploaded(page, timeout=600, *, upload_binding=None):
     from uploader.draft_only import assert_draft_safe
     set_progress_plan('upload', ['transfer'])
     progress_operation('upload', 'transfer')
@@ -344,9 +351,20 @@ async def bili_wait_uploaded(page, timeout=600):
         while time.monotonic()<until:
             await assert_draft_safe(page,'B站')
             state=await _state(frame)
+            if upload_binding is not None:
+                await _tag_context(page, frame, upload_binding)
             if state['task_count']>1:
                 raise DraftInterrupted('B站出现多个素材任务，已停止并保留现场。','adapter_mismatch')
             if state['task_count']==state['done_count']==1:
+                if upload_binding is not None:
+                    # A status badge alone cannot stand for SDK completion or
+                    # bind an old completed task to this import.
+                    keys=json.dumps(_EDITOR_TASK_REFS)
+                    valid=await asyncio.wait_for(upload_binding.evaluate('value=>{'+_EDITOR_OBJECT_JS+
+                        'const live=read("uploaded");return !!live&&'+keys+'.every(key=>live[key]===value[key]);}'),5)
+                    if not valid:
+                        await asyncio.sleep(.2)
+                        continue
                 progress_operation('upload', 'transfer', 'completed')
                 return
             await asyncio.sleep(.2)
@@ -419,7 +437,16 @@ def _resume_tag_proof(page):
     return session,sha,frozenset(links[0]['ids'])
 
 
-async def _tag_binding(page,frame,permission):
+async def _same_task(binding, prior):
+    keys=json.dumps(_EDITOR_TASK_REFS)
+    try:
+        return await asyncio.wait_for(binding.evaluate(
+            '(value,prior)=>!!value&&!!prior&&'+keys+'.every(key=>value[key]===prior[key])',prior),5)
+    except (BrowserError,TimeoutError):
+        return False
+
+
+async def _tag_binding(page,frame,permission, *, allow_uploading=False):
     from uploader.draft_only import draft_resume_active
     if permission is None and not draft_resume_active(page):
         return None
@@ -428,7 +455,9 @@ async def _tag_binding(page,frame,permission):
         raise DraftInterrupted('B站恢复的封存视频证明无法确认，未替换标签。','adapter_mismatch')
     if permission is not None and permission['frame'] is not frame:
         raise DraftInterrupted('B站本次导入编辑器已改变，未替换标签。','adapter_mismatch')
-    binding=await _editor_object(frame,'uploaded')
+    if allow_uploading and permission is None:
+        raise DraftInterrupted('B站上传期间填写须绑定本次原生导入，已停止。','adapter_mismatch')
+    binding=await _editor_object(frame,'importing' if allow_uploading else 'uploaded')
     try:
         valid=await asyncio.wait_for(binding.evaluate(r'''(value,prior)=>!!value&&!!prior&&
             value.document===prior.document&&value.manager===prior.manager&&value.record===prior.record&&
@@ -440,6 +469,7 @@ async def _tag_binding(page,frame,permission):
         await _dispose_editor(binding)
         raise DraftInterrupted('B站原生导入与当前素材无法对应，未替换标签。','adapter_mismatch')
     binding._sau_bili_resumed_proof=resumed
+    binding._sau_bili_uploading=allow_uploading
     return binding
 
 
@@ -449,12 +479,14 @@ async def _tag_context(page,frame,binding):
     if await _frame(page,timeout=.3) is not frame:
         raise DraftInterrupted('B站唯一编辑器已改变，已停止标签操作。','adapter_mismatch')
     state=await _state(frame)
-    if state['task_count']!=state['done_count'] or state['task_count']!=1:
+    uploading=getattr(binding,'_sau_bili_uploading',False)
+    if state['task_count']!=1 or (not uploading and state['done_count']!=1):
         raise DraftInterrupted('B站视频任务已改变，已停止标签操作。','adapter_mismatch')
     if binding is not None:
-        keys=repr(list(_EDITOR_REFS)).replace("'",'"')
+        keys=json.dumps(_EDITOR_TASK_REFS if uploading else _EDITOR_REFS)
         try:
-            valid=await asyncio.wait_for(binding.evaluate('value=>{'+_EDITOR_OBJECT_JS+'const live=read("uploaded");return !!live&&'+
+            mode='importing' if uploading else 'uploaded'
+            valid=await asyncio.wait_for(binding.evaluate('value=>{'+_EDITOR_OBJECT_JS+'const live=read("'+mode+'");return !!live&&'+
                 keys+'.every(key=>live[key]===value[key]);}'),5)
         except (BrowserError,TimeoutError):
             valid=False
@@ -507,7 +539,7 @@ async def _close_extra_tags(page,frame,binding,tags,budget,timeout):
             raise DraftInterrupted('B站该标签删除尚未确切回读，未继续删除。','adapter_mismatch')
 
 
-async def bili_fill_content(page, title, description, tags, tag_timeout=10):
+async def bili_fill_content(page, title, description, tags, tag_timeout=10, *, upload_binding=None):
     if (type(tags) is not list or len(tags)>10 or any(type(t) is not str or not t.strip() or t!=t.strip() for t in tags) or len(set(tags))!=len(tags)):
         raise DraftInterrupted('B站话题标签格式不正确，已停止。','adapter_mismatch')
     content_operations = ['title', 'description'] + (['topics'] if tags else []) + ['readback']
@@ -515,13 +547,15 @@ async def bili_fill_content(page, title, description, tags, tag_timeout=10):
     tag_timeout=min(max(float(tag_timeout),.05),10)
     frame=await _frame(page)
     state=await _state(frame)
-    if state['task_count']!=1 or state['done_count']!=1:
+    if state['task_count']!=1 or (upload_binding is None and state['done_count']!=1):
         raise DraftInterrupted('B站单一视频尚未完成，未填写内容。','adapter_mismatch')
-    permission=getattr(page,'_sau_bili_native_import',None)
-    page._sau_bili_native_import=None
-    binding=None
+    permission=getattr(page,'_sau_bili_native_import',None) if upload_binding is None else None
+    if upload_binding is None:
+        page._sau_bili_native_import=None
+    binding=upload_binding
     try:
-        binding=await _tag_binding(page,frame,permission)
+        if binding is None:
+            binding=await _tag_binding(page,frame,permission)
         title_control=await _unique_visible(frame,TITLE)
         desc=await _unique_visible(frame,DESCRIPTION)
         tag_control=await _unique_visible(frame,TAG)
@@ -580,7 +614,7 @@ async def bili_fill_content(page, title, description, tags, tag_timeout=10):
                     break
                 await asyncio.sleep(.05)
     finally:
-        if binding is not None:
+        if binding is not None and upload_binding is None:
             await _dispose_editor(binding)
         if permission is not None:
             await _dispose_editor(permission['handle'])
@@ -706,7 +740,7 @@ async def _cover_final_diagnostic(frame, snapshot):
         pass
 
 
-async def bili_set_cover(page, cover, timeout=45):
+async def bili_set_cover(page, cover, timeout=45, *, upload_binding=None):
     """Import one selected source through official 4:3/16:9 synchronized UI.
 
     Edited server images are checked as UI readiness only. This does not bind
@@ -717,8 +751,10 @@ async def bili_set_cover(page, cover, timeout=45):
     set_progress_plan('cover', ['editor', 'landscape', 'confirm', 'readback'])
     frame=await _frame(page)
     state=await _state(frame)
-    if state['task_count']!=1 or state['done_count']!=1:
+    if state['task_count']!=1 or (upload_binding is None and state['done_count']!=1):
         raise DraftInterrupted('B站单视频尚未就绪，未编辑封面。','adapter_mismatch')
+    if upload_binding is not None:
+        await _tag_context(page,frame,upload_binding)
     slot=await _unique_visible(frame,COVER_SLOT)
     if await slot.evaluate("el=>el.classList.contains('cover-slot-disabled')||el.classList.contains('cover-slot-offline-action')"):
         raise DraftInterrupted('B站主封面不可编辑，未点击。','platform_restricted')
@@ -733,6 +769,8 @@ async def bili_set_cover(page, cover, timeout=45):
         raise DraftInterrupted('B站主封面入口不唯一，未点击。','adapter_mismatch')
     with progress_part('cover', 'editor'):
         await assert_draft_safe(page,'B站')
+        if upload_binding is not None:
+            await _tag_context(page,frame,upload_binding)
         await target.click()
         await frame.locator('.cover-editor').wait_for(state='visible',timeout=min(timeout,10)*1000)
         initial=await _cover_state(frame)
@@ -749,6 +787,8 @@ async def bili_set_cover(page, cover, timeout=45):
         sync_clicked=False
         while time.monotonic()<until:
             await assert_draft_safe(page,'B站')
+            if upload_binding is not None:
+                await _tag_context(page,frame,upload_binding)
             current=await _cover_state(frame)
             changed=current['signature']!=initial['signature']
             if changed and not current['processing'] and current['queue_empty']:
@@ -780,6 +820,8 @@ async def bili_set_cover(page, cover, timeout=45):
                 "el=>!el.classList.contains('submit-disabled')&&el.getAttribute('aria-disabled')!=='true'&&el.getAttribute('aria-busy')!=='true'"):
             raise DraftInterrupted('B站封面仍在制作，未点击完成。','adapter_mismatch')
         await assert_draft_safe(page,'B站')
+        if upload_binding is not None:
+            await _tag_context(page,frame,upload_binding)
         await done.click()
     # Synchronization was explicitly confirmed before completion, so an
     # unexpected secondary confirmation is retained rather than guessed.

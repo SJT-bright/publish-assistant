@@ -76,8 +76,8 @@ class DraftBrowserTests(unittest.IsolatedAsyncioTestCase):
         title = '小红书标题' * 5
         await self.workbench_fixture({'payload': self.material(title), 'platforms': ['xiaohongshu']})
         await self.page.wait_for_function('document.querySelector("#textLimitIssues").classList.contains("limit-error")')
-        self.assertTrue(await self.page.locator('#save').is_disabled())
-        await self.page.locator('#precheck').click()
+        self.assertFalse(await self.page.locator('#save').is_disabled())
+        await self.page.locator('#save').click()
         await self.page.get_by_text('预检未通过',exact=True).wait_for()
         self.assertEqual(self.started, [])
         self.assertEqual(await self.page.locator('#title').input_value(), title)
@@ -93,7 +93,7 @@ class DraftBrowserTests(unittest.IsolatedAsyncioTestCase):
         await widget.get_by_role('button',name='快手 · 单独设置',exact=True).click()
         await widget.get_by_label('平台独立标题').fill('单独标题')
         await self.page.locator('#precheck').click()
-        await self.page.get_by_text('预检通过 · 保存前还会现场检查平台', exact=True).wait_for()
+        await self.page.get_by_text('预检通过 · 提交前还会现场核验上传与内容', exact=True).wait_for()
         self.assertIn('单独标题\n完整正文\n#生活', await self.page.locator('#preview').inner_text())
         self.assertIn('平台单份暂存快照', await self.page.locator('#preview').inner_text())
         self.assertEqual(self.started, [])
@@ -119,9 +119,9 @@ class WorkbenchBoundaryTests(unittest.TestCase):
             self.assertEqual(data['tags'], ['生活']); self.assertEqual(data['cover'], str((root/'cover.jpg').resolve()))
             self.assertEqual(data['short_title'], '')
 
-    def test_public_publish_action_is_rejected(self):
+    def test_public_publish_still_requires_valid_material(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(workbench, 'PRIVATE', Path(folder)), patch.object(workbench, 'STORE_ROOT', None):
-            with self.assertRaisesRegex(ValueError, '只支持登录和保存草稿'):
+            with self.assertRaisesRegex(ValueError, '素材预检未通过'):
                 workbench.start_job({'action':'publish','platforms':['douyin']})
 
     def test_unknown_platform_cannot_fall_back_to_tencent(self):

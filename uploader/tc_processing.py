@@ -3,6 +3,9 @@
 841.d575b04c.js offsets: updateFile 1750172, handleCropVideo 1750716,
 clipVideoRequest 1752879, getClipVideoResult 1753324, success=1 1744821,
 MaterialEdit consumption 1931820. 97.98a20fe5.js endpoints 66784/66832.
+The same official client permits asyncClip after allocation (1751825):
+MaterialEdit consumes response.httpsUrl plus urlCdnTaskId=clipTicket.draftId
+(1932409/1933355); getCreateOrPreviewParams retains that task (2275944).
 No SDK/business method is called. A derived resource is correlated with the
 original native source SHA; its own bytes are never claimed to have that SHA.
 """
@@ -78,6 +81,8 @@ def _canonical_native(value):
         return None
     metadata = {key: _canonical_dimensions(value.get(key)) for key in ('origin', 'result', 'consumed')}
     if any(item is None for item in metadata.values()):
+        return None
+    if 'mode' in value and value['mode'] != 'async_clip':
         return None
     return {**value, **metadata}
 
@@ -183,12 +188,17 @@ NATIVE_READ_SCRIPT = r"""async scope => {
      file!==other&&other?.originFileObj!==native)return null;
   const response=file.response,processed=file.processedResponse,post=vm.postStore?.postObjDesc;
   const media=post?.media,ticket=vm.postStore?.createPostStatus?.clipTicket,ext=file.extInfo;
-  if(!response||!processed||processed.flag!==1||!Array.isArray(media)||media.length!==1||
+  const asyncClip=!processed&&vm.postStore?.asyncClip===true;
+  if(!response||(!asyncClip&&(!processed||processed.flag!==1))||!Array.isArray(media)||media.length!==1||
      typeof file.uuid!=='string'||!file.uuid||media[0].md5sum!==file.uuid||
-     typeof response.DownloadURL!=='string'||typeof response.httpsUrl!=='string'||typeof processed.url!=='string'||
-     media[0].url!==processed.url||!ticket||!ext)return null;
-  const captured={file,native,processed,url:processed.url,uuid:file.uuid,source:response.httpsUrl,download:response.DownloadURL,
-                  clipKey:ticket.clipKey,draftId:ticket.draftId,media:media[0]};
+     typeof response.DownloadURL!=='string'||typeof response.httpsUrl!=='string'||
+     (!asyncClip&&typeof processed.url!=='string')||!ticket||!ext)return null;
+  const consumedUrl=asyncClip?response.httpsUrl:processed.url;
+  if(media[0].url!==consumedUrl||asyncClip&&(
+      typeof ticket.clipKey!=='string'||!ticket.clipKey||typeof ticket.draftId!=='string'||!ticket.draftId||
+      media[0].urlCdnTaskId!==ticket.draftId))return null;
+  const captured={file,native,processed,url:consumedUrl,uuid:file.uuid,source:response.httpsUrl,download:response.DownloadURL,
+                  clipKey:ticket.clipKey,draftId:ticket.draftId,media:media[0],asyncClip};
   function canonicalSize(value){
    if(typeof value==='number')return Number.isSafeInteger(value)&&value>0&&value<=21474836480?value:null;
    if(typeof value!=='string'||! /^[1-9][0-9]{0,10}$/.test(value))return null;
@@ -203,9 +213,10 @@ NATIVE_READ_SCRIPT = r"""async scope => {
    return {width,height,duration,fileSize:size};
   }
   const originMetadata=metadata(ext.width,ext.height,ext.duration,size),
-        resultMetadata=metadata(processed.width,processed.height,processed.duration,processed.fileSize),
+        resultMetadata=asyncClip?originMetadata:metadata(processed.width,processed.height,processed.duration,processed.fileSize),
         consumedMetadata=metadata(media[0].width,media[0].height,media[0].videoPlayLen,media[0].fileSize);
   if(!originMetadata||!resultMetadata||!consumedMetadata)return null;
+  if(asyncClip&&JSON.stringify(consumedMetadata)!==JSON.stringify(originMetadata))return null;
   const K = new Uint32Array([0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
   const R=(x,n)=>(x>>>n)|(x<<(32-n));
   async function digest(file,size){
@@ -230,17 +241,21 @@ NATIVE_READ_SCRIPT = r"""async scope => {
   const sha256=await fingerprint;
   if(window.__sauTCProcessingReader!==state||vm.fileList.length!==1||vm.fileList[0]!==file||upload.value.length!==1||
      upload.value[0]!==file&&upload.value[0]?.originFileObj!==native||
-     file.originFileObj!==native||file.uuid!==captured.uuid||file.processedResponse!==processed||processed.url!==captured.url||
+     file.originFileObj!==native||file.uuid!==captured.uuid||file.processedResponse!==processed||
+     (!asyncClip&&processed.url!==captured.url)||
+     (asyncClip&&(vm.postStore?.asyncClip!==true||captured.media.urlCdnTaskId!==captured.draftId))||
      file.response?.httpsUrl!==captured.source||file.response?.DownloadURL!==captured.download||
      vm.postStore?.postObjDesc?.media?.length!==1||vm.postStore.postObjDesc.media[0]!==captured.media||
      captured.media.url!==captured.url||captured.media.md5sum!==captured.uuid||
      vm.postStore?.createPostStatus?.clipTicket?.clipKey!==captured.clipKey||vm.postStore.createPostStatus.clipTicket.draftId!==captured.draftId||
      JSON.stringify(metadata(ext.width,ext.height,ext.duration,size))!==JSON.stringify(originMetadata)||
-     JSON.stringify(metadata(processed.width,processed.height,processed.duration,processed.fileSize))!==JSON.stringify(resultMetadata)||
+     (!asyncClip&&JSON.stringify(metadata(processed.width,processed.height,processed.duration,processed.fileSize))!==JSON.stringify(resultMetadata))||
      JSON.stringify(metadata(media[0].width,media[0].height,media[0].videoPlayLen,media[0].fileSize))!==JSON.stringify(consumedMetadata))return null;
-  return {name,size,sha256,uuid:captured.uuid,source_url:captured.source,download_url:captured.download,
-          processed_url:captured.url,ticket:{clipKey:captured.clipKey,draftId:captured.draftId},
+  const result={name,size,sha256,uuid:captured.uuid,source_url:captured.source,download_url:captured.download,
+          processed_url:asyncClip?null:captured.url,ticket:{clipKey:captured.clipKey,draftId:captured.draftId},
           origin:originMetadata,result:resultMetadata,consumed:consumedMetadata};
+  if(asyncClip)Object.assign(result,{mode:'async_clip',consumed_url:captured.url,url_cdn_task_id:captured.draftId});
+  return result;
  }catch(_){return null;}
 }"""
 
@@ -303,6 +318,7 @@ class TCProcessingObserver:
                       'ticket': _ticket(body), 'valid': bool(terminal and resource and _dimensions(payload)),
                       'resource': resource, 'url': payload.get('url') if terminal else None,
                       'dimensions': _canonical_dimensions({k: payload[k] for k in ('width', 'height', 'duration', 'fileSize')}) if terminal and _dimensions(payload) else None,
+                      'pending': bool(success and isinstance(payload, dict) and type(payload.get('flag')) is int and payload['flag'] == 2),
                       'failed': not success or isinstance(payload, dict) and type(payload.get('flag')) is int and payload['flag'] in (3, 4)}
         if record is not None and len(self.records) < 512:
             self.records.append(record)
@@ -311,7 +327,7 @@ class TCProcessingObserver:
         _safe_diagnostic(operation, response, body, data, timed, bool(record and record['valid']))
 
     async def drain(self):
-        if not self._current() or not any(x['operation'] == 'result' and x['valid'] for x in self.records):
+        if not self._current() or not any(x['operation'] == 'allocate' and x['valid'] for x in self.records):
             self.native = None
             return
         async with self._lock:
@@ -326,6 +342,7 @@ class TCProcessingObserver:
                 'results': sum(x['operation'] == 'result' for x in self.records),
                 'terminals': sum(x['operation'] == 'result' and x['valid'] for x in self.records),
                 'native_read_valid': self.native is not None,
+                'native_async_clip': bool(self.native and self.native.get('mode') == 'async_clip'),
                 'native_sha_match': bool(self.native and self.native.get('sha256') == self.session.expected.get('video_sha256')),
                 'scope_current': self._current()}
             if summary != self._last_summary:
@@ -382,10 +399,18 @@ class TCProcessingObserver:
                 type(expires_at) in (int, float) and time.time() < expires_at and
                 getattr(session, '_checkpoint_baseline_hashes', None) is not None and
                 len(videos) == 1 and videos[0] in links and not selected and not self.records and not session.exchanges)
+        if self.native.get('mode') == 'async_clip' and not self.async_candidate_verified(candidate):
+            return False
+        covers = {}
+        if session.expected.get('cover_sha256'):
+            observer = getattr(session, 'tc_cover_observer', None)
+            covers = observer.freeze_records(candidate, checked_links) if observer is not None else None
+            if covers is None:
+                return False
         self._frozen_reopen = {'native': copy.deepcopy(self.native), 'expected': copy.deepcopy(session.expected),
             'assets': copy.deepcopy(session.assets), 'files': copy.deepcopy(session.files),
             'exchanges': copy.deepcopy(session.exchanges), 'records': copy.deepcopy(self.records),
-            'candidate': copy.deepcopy(candidate), 'links': copy.deepcopy(checked_links), 'at': time.time()}
+            'candidate': copy.deepcopy(candidate), 'links': copy.deepcopy(checked_links), 'covers': covers, 'at': time.time()}
         return True
 
     def _frozen_current(self, links):
@@ -394,31 +419,97 @@ class TCProcessingObserver:
             return False
         binding = getattr(session, 'normal_ui_binding', None)
         candidate = frozen['candidate']
-        return (self._frozen_events_current() and
+        base = (self._frozen_events_current() and
             type(getattr(session, 'reopen_at', None)) in (int, float) and session.reopen_at >= frozen['at'] and
-            binding == {'id': candidate['id'], 'owner': candidate['owner'], 'control': 'post_draft_item_edit'} and
-            self._augment_with_native(links, frozen['native']) == (frozen['links'], True))
+            binding == {'id': candidate['id'], 'owner': candidate['owner'], 'control': 'post_draft_item_edit'})
+        if not base:
+            return False
+        task_rows = frozen['candidate'].get('tc_media', [])
+        task_bound = (len(task_rows) == 1 and task_rows[0].get('task') == frozen['native']['ticket']['draftId'])
+        if frozen['native'].get('mode') == 'async_clip' or task_bound:
+            # Retain the original attested upload after a legitimate terminal.
+            # Derived IDs are never rewritten to the original or assigned its SHA.
+            videos = [x for x in links if x.get('kind') == 'video']
+            old = [x for x in frozen['links'] if x.get('kind') == 'video']
+            extra = {x['resource'] for x in self.records if x['operation'] == 'result' and x.get('valid') and
+                     x['ticket'] == _ticket(frozen['native']['ticket'])}
+            return (len(videos) == len(old) == 1 and videos[0].get('complete') is True and
+                videos[0].get('sha256') == old[0]['sha256'] and
+                tc_resource_identity(frozen['native']['source_url']) in videos[0].get('ids', []) and
+                set(videos[0].get('ids', [])) <= set(old[0]['ids']) | extra and
+                [x for x in links if x.get('kind') != 'video'] == [x for x in frozen['links'] if x.get('kind') != 'video'])
+        return self._augment_with_native(links, frozen['native']) == (frozen['links'], True)
 
     def _frozen_events_current(self):
         frozen, session = self._frozen_reopen, self.session
         return bool(frozen and self._current() and not getattr(session, 'issues', ['missing']) and
             session.expected == frozen['expected'] and session.assets == frozen['assets'] and
             session.files == frozen['files'] and session.exchanges == frozen['exchanges'] and
-            self.records == frozen['records'] and
+            self._frozen_processing_current(frozen) and
+            (not frozen.get('covers') or getattr(session, 'tc_cover_observer', None) is not None and
+             session.tc_cover_observer.frozen_current(frozen['covers'])) and
             any(item == frozen['candidate'] for item in getattr(session, 'saves', [])))
+
+    def _frozen_processing_current(self, frozen):
+        original = frozen['records']
+        if self.records == original:
+            return True
+        task_rows = frozen['candidate'].get('tc_media', [])
+        task_bound = (len(task_rows) == 1 and task_rows[0].get('task') == frozen['native']['ticket']['draftId'])
+        if ((frozen['native'].get('mode') != 'async_clip' and not task_bound) or
+                self.records[:len(original)] != original):
+            return False
+        ticket = _ticket(frozen['native'].get('ticket'))
+        # A normal in-flight flag=2 poll may finish while leaving the editor.
+        # It changes neither the uploaded original nor the saved task. A new
+        # known successful terminal must independently match the allocation's
+        # target. Errors, unknown states, other tasks or mutation invalidate.
+        from uploader.tc_reopen_mapping import processing_target_matches
+        allocation_at = max(x['observed_at'] for x in original if x['operation'] == 'allocate')
+        return all(item['operation'] == 'result' and item['ticket'] == ticket and item['failed'] is False and
+                   (item.get('pending') is True or item.get('valid') is True and item['request_at'] >= allocation_at and
+                    tc_resource_identity(item.get('url')) == item.get('resource') and
+                    processing_target_matches(self, item.get('dimensions'), frozen))
+                   for item in self.records[len(original):])
 
     def augment_links(self, links):
         if self._frozen_reopen and not self._frozen_events_current():
             self._frozen_reopen = None
         if self.native is not None:
             if self._frozen_reopen and self.native != self._frozen_reopen['native']:
-                self._frozen_reopen = None
+                frozen = self._frozen_reopen
+                from uploader.tc_reopen_mapping import processing_target_matches
+                original, current = frozen['native'], self.native
+                valid_transition = (original.get('mode') == 'async_clip' and current.get('mode') != 'async_clip' and
+                    all(current.get(k) == original.get(k) for k in ('sha256', 'uuid', 'source_url', 'download_url', 'ticket', 'origin')) and
+                    processing_target_matches(self, current.get('result'), frozen) and
+                    self._augment_with_native(links, current)[1])
+                if not valid_transition:
+                    self._frozen_reopen = None
+            if self._frozen_current(links):
+                return copy.deepcopy(self._frozen_reopen['links'])
             return self._augment_with_native(links, self.native)[0]
         if self._frozen_current(links):
             return copy.deepcopy(self._frozen_reopen['links'])
         # Before a normal same-ID edit is attested, missing/malformed live
         # state never inherits a preceding successful read.
         return copy.deepcopy(links)
+
+    def current_publication_resource(self, links):
+        """A typed current consumer plus the complete original upload proof."""
+        _, valid = self._augment_with_native(links, self.native)
+        if not valid:
+            return None
+        value = self.native.get('consumed_url') if self.native.get('mode') == 'async_clip' else self.native.get('processed_url')
+        return tc_resource_identity(value)
+
+    def async_candidate_verified(self, candidate):
+        native = self.native
+        if not isinstance(native, dict) or native.get('mode') != 'async_clip' or not isinstance(candidate, dict):
+            return False
+        resource = tc_resource_identity(native.get('source_url'))
+        return (candidate.get('video_count') == 1 and candidate.get('video_ids') == [resource] and
+                candidate.get('tc_media_tasks') == [{'resource': resource, 'draft_id': native['ticket']['draftId']}])
 
     def _augment_with_native(self, links, native):
         result = copy.deepcopy(links)
@@ -455,6 +546,15 @@ class TCProcessingObserver:
             return result, False
         terminal = [x for x in self.records if x['operation'] == 'result' and x['ticket'] == allocation['ticket'] and
                     x['request_at'] >= allocation['observed_at']]
+        if native.get('mode') == 'async_clip':
+            if (native.get('processed_url') is not None or native.get('consumed_url') != native.get('source_url') or
+                    native.get('url_cdn_task_id') != allocation['ticket'][1] or
+                    native['result'] != native['origin'] or native['consumed'] != native['origin'] or
+                    any(item.get('pending') is not True or item['failed'] for item in terminal)):
+                return result, False
+            # This mode consumes the original uploaded resource and the exact
+            # current allocation ticket. Never call it a processed resource.
+            return result, True
         complete = [x for x in terminal if x['valid']]
         if (not complete or any(x['failed'] for x in terminal) or
                 len({(x['resource'], x['url']) for x in complete}) != 1):

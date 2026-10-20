@@ -19,7 +19,7 @@ function harness(){
   const dialog={showMessageBoxSync:(parent,options)=>{
     prompts.push({parent,options});if(onPrompt)onPrompt();return response;
   }};
-  const app={isPackaged:false,getPath:()=>'/isolated-unload-profile',setPath:()=>{},setName:()=>{},setAboutPanelOptions:()=>{},
+  const app={isPackaged:false,getVersion:()=> 'isolated-test',getPath:()=>'/isolated-unload-profile',setPath:()=>{},setName:()=>{},setAboutPanelOptions:()=>{},
     commandLine:{appendSwitch:()=>{}},requestSingleInstanceLock:()=>false,quit:()=>{},on:()=>{}};
   const fakeFs={...fs,mkdirSync:()=>{},writeFileSync:(...args)=>writes.push(args)};
   const sandbox={require:name=>name==='electron'?{app,dialog}:name==='node:fs'?fakeFs:require(name),

@@ -8,6 +8,7 @@ from uploader.local_files import set_local_files
 import asyncio
 import inspect
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -613,13 +614,24 @@ class KSVideo(KSBaseUploader):
         if getattr(self, "draft_only", False):
             from uploader.draft_only import assert_draft_safe
             await assert_draft_safe(page, "快手")
-            scope = page
             with progress_part("cover", "editor"):
-                for frame in page.frames:
-                    if await frame.locator("span").filter(has_text="封面设置").count():
-                        scope = frame
+                deadline = asyncio.get_running_loop().time() + getattr(self, "draft_upload_timeout", 900)
+                while True:
+                    await assert_draft_safe(page, "快手")
+                    labels = []
+                    for frame in page.frames:
+                        for candidate in await frame.locator("span").filter(
+                                has_text=re.compile(r'^\s*封面设置\s*$')).all():
+                            if await candidate.is_visible():
+                                labels.append((frame, candidate))
+                    if len(labels) > 1:
+                        raise RuntimeError("快手存在多个封面设置组件，已保留当前视频。")
+                    if labels:
+                        scope, label = labels[0]
                         break
-                label = scope.locator("span").filter(has_text="封面设置").first
+                    if asyncio.get_running_loop().time() >= deadline:
+                        raise RuntimeError("快手封面设置组件仍未加载，已保留当前视频。")
+                    await asyncio.sleep(.25)
                 await label.locator("xpath=../following-sibling::div[1]").locator("div").nth(0).click(timeout=15000)
                 modal = scope.locator('div[role="document"].ant-modal:visible').first
                 await modal.wait_for(state="visible", timeout=15000)
@@ -667,7 +679,54 @@ class KSVideo(KSBaseUploader):
     async def _upload_draft_content(self, page: Page) -> None:
         from platform_limits import assert_adapter_draft_text
         assert_adapter_draft_text("kuaishou", self)
-        from uploader.draft_only import assert_draft_safe, save_draft, wait_draft_upload, draft_resume_active, checkpoint_after_upload
+        from uploader.draft_only import assert_draft_safe, save_draft, draft_resume_active, checkpoint_after_upload
+        from uploader.upload_pipeline import run_upload_pipeline
+        from uploader.xhs_ks_upload_ready import wait_xhs_ks_upload_complete
+
+        async def wait_upload():
+            with progress_step("upload", operations=["transfer"]):
+                with progress_part("upload", "transfer"):
+                    await wait_xhs_ks_upload_complete(page, "kuaishou", timeout=getattr(self, "draft_upload_timeout", 900))
+            await checkpoint_after_upload(page)
+
+        async def prepare_content():
+            with progress_step("content", operations=["description", "readback"]):
+                with progress_part("content", "description"):
+                    await self.close_guide_overlay(page)
+                    expected = getattr(self, "draft_expected", None) or {}
+                    caption = expected.get("platform_fields", {}).get("caption")
+                    if caption is None:
+                        parts = [self.title, self.desc or "", " ".join("#" + tag for tag in self.tags)]
+                        caption = "\n".join(part for part in parts if part)
+                    if not isinstance(caption, str):
+                        raise ValueError("快手 caption 必须是完整文本。")
+                    editor = None
+                    deadline = asyncio.get_running_loop().time() + getattr(self, "draft_upload_timeout", 900)
+                    while asyncio.get_running_loop().time() < deadline:
+                        await assert_draft_safe(page, "快手")
+                        editors = []
+                        for frame in page.frames:
+                            editors.extend(await frame.locator('[contenteditable="true"]:visible').all())
+                        # Fail closed rather than choose one of several unrelated editors.
+                        if len(editors) > 1:
+                            raise RuntimeError("快手存在多个描述组件，草稿任务已停止。")
+                        if len(editors) == 1:
+                            editor = editors[0]
+                            break
+                        await asyncio.sleep(.25)
+                    if editor is None:
+                        raise RuntimeError("等待快手描述组件超时，草稿任务已停止。")
+                    await assert_draft_safe(page, "快手")
+                    await editor.fill(caption, timeout=15000)
+                with progress_part("content", "readback"):
+                    if (await editor.inner_text()).replace("\r\n", "\n").rstrip("\n") != caption.replace("\r\n", "\n").rstrip("\n"):
+                        raise RuntimeError("快手完整 caption 回读不一致，草稿任务已停止。")
+            if self.thumbnail_path:
+                with progress_step("cover", operations=["editor", "readback", "confirm"]):
+                    await self.set_thumbnail(page)
+            else:
+                emit_progress("cover", "skipped")
+
         if not draft_resume_active(page):
             with progress_step("video", operations=["locate", "select"]):
                 await assert_draft_safe(page, "快手")
@@ -713,49 +772,10 @@ class KSVideo(KSBaseUploader):
                 with progress_part("video", "select"):
                     await ensure_ks_draft_evidence(page)
                     await set_local_files(page, file_input, self.file_path)
-            with progress_step("upload", operations=["transfer"]):
-                with progress_part("upload", "transfer"):
-                    await wait_draft_upload(page, "快手", [
-                        ':text-is("上传成功")', ':text-is("视频上传成功")', ':text-is("重新上传")',
-                        'video[src]:not([src=""])', 'video source[src]:not([src=""])'
-                    ], [':text("上传中")', ':text("视频上传中")', ':text("转码中")', ':text("处理中")'], timeout=getattr(self, "draft_upload_timeout", 900))
-        await checkpoint_after_upload(page)
-        with progress_step("content", operations=["description", "readback"]):
-            with progress_part("content", "description"):
-                await self.close_guide_overlay(page)
-                expected = getattr(self, "draft_expected", None) or {}
-                caption = expected.get("platform_fields", {}).get("caption")
-                if caption is None:
-                    parts = [self.title, self.desc or "", " ".join("#" + tag for tag in self.tags)]
-                    caption = "\n".join(part for part in parts if part)
-                if not isinstance(caption, str):
-                    raise ValueError("快手 caption 必须是完整文本。")
-                editor = None
-                deadline = asyncio.get_running_loop().time() + 30
-                while asyncio.get_running_loop().time() < deadline:
-                    await assert_draft_safe(page, "快手")
-                    editors = []
-                    for frame in page.frames:
-                        editors.extend(await frame.locator('[contenteditable="true"]:visible').all())
-                    # Fail closed rather than choose one of several unrelated editors.
-                    if len(editors) > 1:
-                        raise RuntimeError("快手存在多个描述组件，草稿任务已停止。")
-                    if len(editors) == 1:
-                        editor = editors[0]
-                        break
-                    await asyncio.sleep(.25)
-                if editor is None:
-                    raise RuntimeError("等待快手描述组件超时，草稿任务已停止。")
-                await assert_draft_safe(page, "快手")
-                await editor.fill(caption, timeout=15000)
-            with progress_part("content", "readback"):
-                if (await editor.inner_text()).replace("\r\n", "\n").rstrip("\n") != caption.replace("\r\n", "\n").rstrip("\n"):
-                    raise RuntimeError("快手完整 caption 回读不一致，草稿任务已停止。")
-        if self.thumbnail_path:
-            with progress_step("cover", operations=["editor", "readback", "confirm"]):
-                await self.set_thumbnail(page)
+            await run_upload_pipeline(page, "kuaishou", wait_upload, prepare_content)
         else:
-            emit_progress("cover", "skipped")
+            await checkpoint_after_upload(page)
+            await prepare_content()
         await assert_draft_safe(page, "快手")
         await save_draft(page, "快手", self.title, getattr(self, "draft_receipt", None), expected=getattr(self, "draft_expected", None))
 

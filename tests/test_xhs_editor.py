@@ -149,7 +149,7 @@ class XhsNativeUploadGateTests(unittest.TestCase):
                     uploader.fill_meta = AsyncMock()
                     with patch('uploader.draft_only.assert_draft_safe', new=AsyncMock()), \
                          patch('uploader.draft_only.draft_resume_active', return_value=False), \
-                         patch('uploader.draft_only.wait_draft_upload', new=AsyncMock()), \
+                         patch('uploader.xhs_ks_upload_ready.wait_xhs_ks_upload_complete', new=AsyncMock()), \
                          patch('uploader.draft_only.checkpoint_after_upload', new=AsyncMock()), \
                          patch('uploader.draft_only.save_draft', new=AsyncMock()) as save, \
                          patch('uploader.xiaohongshu_uploader.main.set_local_files', new=AsyncMock(side_effect=selected)) as files:

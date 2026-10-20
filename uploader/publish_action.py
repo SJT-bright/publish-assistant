@@ -7,8 +7,10 @@ whether this single UI action produced a documented submission receipt.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import math
+import re
 from dataclasses import dataclass
 from urllib.parse import parse_qs, urlsplit
 
@@ -21,13 +23,24 @@ PUBLISHED_SUBMISSION_VERIFIED = "published_submission_verified"
 PUBLISHED_UNVERIFIED = "published_unverified"
 PUBLICATION_BLOCKED = "publication_blocked"
 
-# These are the documented public API response contracts, not guessed schemas
-# for private creator-page endpoints. A creator page may use a different route;
-# that response remains unverified unless a platform success page is explicit.
+# Supported response contracts are documented public APIs or exact native
+# contracts read from the official creator source. Other responses remain
+# unverified unless a platform success page is explicit.
 _DOCUMENTED_API_HOSTS = {
     ("open.douyin.com", "/video/create"): "douyin",
+    # Official 1060.abf5c0f7.js SHA-256
+    # d6cf9d973d443c64cd5216bf5d1d4de8185947a05637121720971f78d6d6697a:
+    # create_v2 resolves the raw body and consumes top-level item_id.
+    # HTTP module31687 in douyin_content_index_micro_new.3d7bbdb6.js SHA
+    # 1d11fe80cc8ee374765b51d9969e56b9d3e8a5d7ca501ec939d229989823a9fc
+    # returns response.data, rejecting code0 + status_msg="url doesn't match".
+    ("creator.douyin.com", "/web/api/media/aweme/create_v2"): "douyin_web",
     ("open.kuaishou.com", "/openapi/photo/publish"): "kuaishou",
     ("member.bilibili.com", "/arcopen/fn/archive/add-by-utoken"): "bilibili",
+    # Official creator source fresh-bili-index.ad9b754d.js SHA-256
+    # d0c283365e4210fa95c166a4f99371397e00ce30a4790fafaa755d3c5e6e799a
+    # submitArchive returns data at code==0; its consumer reads aid/bvid.
+    ("member.bilibili.com", "/x/vu/web/add/v3"): "bilibili_web",
 }
 _XHS_SUCCESS_PATH = "/publish/success"
 
@@ -47,6 +60,7 @@ class _Observation:
     responses: list | None = None
     tasks: list | None = None
     event: asyncio.Event | None = None
+    receipt_scope: dict | None = None
 
     def __post_init__(self):
         self.requests = {}
@@ -150,7 +164,55 @@ async def _visible_exact_role_buttons(frame, name):
     return result
 
 
+# Native Jh button in index-D9cEpjz5.js (SHA-256
+# 6810b8d05825220acf807a7841f7773c4ea2e623596f956ad84ec5e631e77d2c)
+# renders a clickable div with a nested text div. Loading/disabled use its
+# _disabled_* class; edit-section-btns lives inside edit-section-form.
+_KS_CONTROL_ENABLED = r"""el => {
+ if(location.origin!=='https://cp.kuaishou.com'||
+    location.pathname!=='/article/publish/video'||!el.isConnected||
+    el.innerText.trim()!=='发布'||el.closest('[role="dialog"],.ant-modal'))return false;
+ const visible=e=>{const r=e.getBoundingClientRect(),s=getComputedStyle(e);
+   return e.isConnected&&r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};
+ let host=el,form=null;
+ if(el.tagName!=='BUTTON'){
+   while(host&&host!==document.body&&![...host.classList].some(c=>/^_button_[a-z0-9]+_\d+$/.test(c)))
+     host=host.parentElement;
+   if(!host||host.tagName!=='DIV'||![...host.classList].some(c=>/^_button-primary_[a-z0-9]+_\d+$/.test(c))||
+      host.innerText.trim()!=='发布')return false;
+   form=host.closest('[class*="edit-section-form"]');
+   const footer=host.closest('[class*="edit-section-btns"]');
+   if(!form||!footer||!form.contains(footer)||!visible(form)||
+      [...document.querySelectorAll('[class*="edit-section-form"]')].filter(visible).length!==1||
+      ![...form.querySelectorAll('[contenteditable="true"]')].some(visible))return false;
+ }else{
+   form=host.closest('[class*="edit-section-form"],form');
+   if(!form||!visible(form)||![...form.querySelectorAll('[contenteditable="true"]')].some(visible))return false;
+ }
+ if(!visible(host)||Number(getComputedStyle(host).opacity)<.99)return false;
+ for(let node=el;node;node=node.parentElement){
+   const style=getComputedStyle(node);
+   if(node.disabled===true||node.hasAttribute('disabled')||node.inert||
+      node.getAttribute('aria-disabled')==='true'||node.getAttribute('aria-busy')==='true'||
+      [...node.classList].some(c=>/^_disabled_[a-z0-9]+_\d+$/.test(c)||
+        ['disabled','btn-loading','ant-btn-loading'].includes(c))||style.pointerEvents==='none')return false;
+   if(node===form||node===document.body)break;
+ }
+ return true;
+}"""
+
+
 async def _button_enabled(button, platform):
+    if platform == "tencent":
+        try:
+            return await button.is_enabled() and await button.evaluate(_TC_CONTROL_CURRENT) is True
+        except Exception:
+            return False
+    if platform == "kuaishou":
+        try:
+            return await button.is_enabled() and await button.evaluate(_KS_CONTROL_ENABLED) is True
+        except Exception:
+            return False
     if platform == "bilibili":
         try:
             return await button.evaluate(
@@ -202,6 +264,8 @@ async def _frame_editor_ready(frame, platform):
             'div.zone-container[contenteditable="true"]:visible',
         )
         video = (
+            'video[src]:not([src=""])',
+            'video source[src]:not([src=""])',
             '[class^="long-card"] div:has-text("重新上传")',
             ':text-is("上传成功")',
             ':text-is("视频上传成功")',
@@ -255,6 +319,15 @@ async def _unique_control_in_frame(frame, platform):
         found = await _visible_exact_role_buttons(frame, label)
     except Exception:
         return None, "final_control_unreadable"
+    if platform == "kuaishou" and not found:
+        # The official native primary control is a div, so it has no button
+        # role. Exact text is only accepted inside its current editor form.
+        try:
+            matches = frame.get_by_text("发布", exact=True)
+            found = [matches.nth(index) for index in range(await matches.count())
+                     if await matches.nth(index).is_visible()]
+        except Exception:
+            return None, "final_control_unreadable"
     if len(found) != 1:
         return None, "final_control_not_unique"
     if not await _button_enabled(found[0], platform):
@@ -262,30 +335,135 @@ async def _unique_control_in_frame(frame, platform):
     return found[0], None
 
 
-async def _locate_current_editor(page, platform):
-    frames = [frame for frame in _page_frames(page) if _official_editor_route(getattr(frame, "url", ""), platform)]
-    if len(frames) != 1:
-        return None, "editor_not_unique_or_wrong_page"
+_TC_CONTROL_CURRENT = r"""el => {
+ const view=el.ownerDocument?.defaultView,location=view?.location;
+ if(!location||location.origin!=='https://channels.weixin.qq.com'||
+    !['/platform/post/create','/micro/content/post/create'].includes(location.pathname)||
+    !el.isConnected||el.tagName!=='BUTTON'||el.innerText.trim()!=='发表')return false;
+ const visible=e=>{const r=e.getBoundingClientRect(),s=view.getComputedStyle(e);
+   return e.isConnected&&r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';};
+ const form=el.closest('div.form-btns');
+ return !!form&&visible(form)&&visible(el)&&!el.disabled&&el.getAttribute('aria-disabled')!=='true'&&
+   el.getAttribute('aria-busy')!=='true'&&view.getComputedStyle(el).pointerEvents!=='none'&&
+   [...form.querySelectorAll('button')].filter(e=>visible(e)&&e.innerText.trim()==='发表').length===1;
+}"""
 
-    frame = frames[0]
+
+def _owned_editor_frame(page, frame, platform):
+    try:
+        parsed=urlsplit(frame.url)
+        host={'tencent':'channels.weixin.qq.com','bilibili':'member.bilibili.com'}[platform]
+        return (frame.page is page and frame in _page_frames(page) and not frame.is_detached() and
+                parsed.scheme=='https' and parsed.netloc==host and _official_editor_route(frame.url,platform))
+    except Exception:
+        return False
+
+
+def _editor_snapshot(page, platform):
+    try:
+        main=page.main_frame
+        if page.is_closed() or page.url!=main.url or not _owned_editor_frame(page,main,platform):
+            return None
+        return main,page.url,tuple((frame,frame.url) for frame in _page_frames(page))
+    except Exception:
+        return None
+
+
+def _editor_unchanged(page, platform, snapshot):
+    return snapshot is not None and _editor_snapshot(page,platform)==snapshot
+
+
+async def _locate_tencent_control(page):
+    snapshot=_editor_snapshot(page,'tencent')
+    if snapshot is None or urlsplit(snapshot[1]).path!='/platform/post/create':
+        return None,'editor_not_unique_or_wrong_page'
+    frames=[frame for frame,_ in snapshot[2] if _owned_editor_frame(page,frame,'tencent')]
+    if (len(frames) not in (1,2) or snapshot[0] not in frames or
+            any(frame is not snapshot[0] and (urlsplit(frame.url).path!='/micro/content/post/create' or
+                                             frame.parent_frame is not snapshot[0]) for frame in frames)):
+        return None,'editor_not_unique_or_wrong_page'
+    if not await _tencent_upload_ready(page) or not _editor_unchanged(page,'tencent',snapshot):
+        return None,'video_not_ready'
+    handles=[]
+    chosen=None
+    try:
+        physical=[]
+        for frame in frames:
+            forms=frame.locator('div.form-btns')
+            if await forms.count()>8:
+                return None,'final_control_not_unique'
+            for index in range(await forms.count()):
+                form=forms.nth(index)
+                if not await form.is_visible():
+                    continue
+                buttons=form.get_by_role('button',name='发表',exact=True)
+                if await buttons.count()>8:
+                    return None,'final_control_not_unique'
+                visible=[buttons.nth(i) for i in range(await buttons.count()) if await buttons.nth(i).is_visible()]
+                if len(visible)!=1:
+                    return None,'final_control_not_unique'
+                control=await visible[0].element_handle(timeout=1000)
+                if control is None:
+                    return None,'final_control_unreadable'
+                handles.append(control)
+                owner=await control.owner_frame()
+                if (owner not in frames or not _owned_editor_frame(page,owner,'tencent') or
+                        not _editor_unchanged(page,'tencent',snapshot)):
+                    return None,'final_control_owner_changed'
+                if (not await control.is_visible() or not await control.is_enabled() or
+                        await control.evaluate(_TC_CONTROL_CURRENT) is not True):
+                    return None,'final_control_disabled'
+                duplicate=False
+                for previous,previous_owner in physical:
+                    if owner is previous_owner and await previous.evaluate('(el,other)=>el===other',control) is True:
+                        duplicate=True
+                        break
+                if not duplicate:
+                    physical.append((control,owner))
+        if len(physical)!=1:
+            return None,'final_control_not_unique'
+        control,owner=physical[0]
+        if (not await _tencent_upload_ready(page) or not _editor_unchanged(page,'tencent',snapshot) or
+                await control.owner_frame() is not owner or not _owned_editor_frame(page,owner,'tencent') or
+                await control.evaluate(_TC_CONTROL_CURRENT) is not True):
+            return None,'final_control_changed'
+        chosen=control
+        return _Candidate(owner,control),None
+    except Exception:
+        return None,'final_control_unreadable'
+    finally:
+        for handle in handles:
+            if handle is chosen:
+                continue
+            try:
+                await handle.dispose()
+            except Exception:
+                pass
+
+
+async def _locate_current_editor(page, platform):
+    if platform == "tencent":
+        return await _locate_tencent_control(page)
+    frames = [frame for frame in _page_frames(page) if _official_editor_route(getattr(frame, "url", ""), platform)]
+    snapshot = None
     if platform == "bilibili":
-        observed = await _bili_upload_ready(page)
-        if observed is None or observed is not frame:
+        snapshot = _editor_snapshot(page, platform)
+        if snapshot is None:
+            return None, "editor_not_unique_or_wrong_page"
+        frame = await _bili_upload_ready(page)
+        if (frame not in frames or not _owned_editor_frame(page, frame, platform) or
+                not _editor_unchanged(page, platform, snapshot)):
             return None, "video_not_ready"
+    else:
+        if len(frames) != 1:
+            return None, "editor_not_unique_or_wrong_page"
+        frame = frames[0]
+    if platform == "bilibili":
         try:
             title = frame.locator(".video-title .video-title-content input")
             description = frame.locator(".desc-container .ql-editor[contenteditable='true']")
             if (await title.count() != 1 or not await title.first.is_visible()
                     or await description.count() != 1 or not await description.first.is_visible()):
-                return None, "editor_not_ready"
-        except Exception:
-            return None, "editor_not_ready"
-    elif platform == "tencent":
-        if not await _tencent_upload_ready(page):
-            return None, "video_not_ready"
-        try:
-            form = frame.locator("div.form-btns")
-            if await form.count() != 1 or not await form.first.is_visible():
                 return None, "editor_not_ready"
         except Exception:
             return None, "editor_not_ready"
@@ -306,6 +484,10 @@ async def _locate_current_editor(page, platform):
     control, error = await _unique_control_in_frame(frame, platform)
     if error:
         return None, error
+    if platform == "bilibili" and (
+            await _bili_upload_ready(page) is not frame or not _editor_unchanged(page, platform, snapshot) or
+            not _owned_editor_frame(page, frame, platform)):
+        return None, "final_control_changed"
     return _Candidate(frame, control), None
 
 
@@ -326,9 +508,15 @@ def _is_observed_publish_request(url, method):
 def _documented_contract_url(url):
     try:
         parsed = urlsplit(url)
+        if (parsed.scheme != "https" or parsed.username or parsed.password or
+                parsed.port not in (None, 443)):
+            return None
         host = parsed.hostname
         path = parsed.path.rstrip("/") or "/"
-        return _DOCUMENTED_API_HOSTS.get((host, path))
+        variant = _DOCUMENTED_API_HOSTS.get((host, path))
+        if variant == "douyin_web" and parsed.path not in (path, path + "/"):
+            return None
+        return variant
     except (TypeError, ValueError):
         return None
 
@@ -343,12 +531,27 @@ def _extract_documented_id(platform, body):
                 and type(data.get("error_code")) is int and data.get("error_code") == 0
                 and isinstance(data.get("item_id"), str) and data["item_id"]):
             return data["item_id"]
+    elif platform == "douyin_web":
+        identifier = body.get("item_id")
+        if (type(body.get("status_code")) is int and body["status_code"] == 0 and
+                body.get("status_msg") != "url doesn't match"):
+            if type(identifier) is int and identifier > 0:
+                return str(identifier)
+            if isinstance(identifier, str) and re.fullmatch(r"[1-9][0-9]*", identifier):
+                return identifier
     elif platform == "kuaishou":
         info = body.get("video_info")
         if (type(body.get("result")) is int and body.get("result") == 1
                 and isinstance(info, dict) and isinstance(info.get("photo_id"), str)
                 and info["photo_id"]):
             return info["photo_id"]
+    elif platform == "bilibili_web":
+        data=body.get("data")
+        if type(body.get("code")) is int and body["code"]==0 and isinstance(data,dict):
+            aid,bvid=data.get("aid"),data.get("bvid")
+            positive_aid=type(aid) is int and aid>0 or isinstance(aid,str) and bool(re.fullmatch(r"[1-9][0-9]*",aid))
+            if positive_aid and isinstance(bvid,str) and re.fullmatch(r"BV[A-Za-z0-9]{10}",bvid):
+                return bvid
     elif platform == "bilibili":
         data = body.get("data")
         if (type(body.get("code")) is int and body.get("code") == 0
@@ -386,10 +589,13 @@ def _bind_observer(page, observation):
         try:
             if request.frame is not observation.frame:
                 return
+            if observation.platform == 'xiaohongshu' and (request.method != 'POST' or not _xhs_native_submit_url(request.url)):
+                return
         except Exception:
             return
         contract_platform = _documented_contract_url(request.url)
-        observation.requests[id(request)] = contract_platform if contract_platform == observation.platform else None
+        owner = {"douyin_web": "douyin", "bilibili_web": "bilibili"}.get(contract_platform, contract_platform)
+        observation.requests[id(request)] = contract_platform if owner == observation.platform else None
         observation.event.set()
 
     def on_response(response):
@@ -457,12 +663,83 @@ def _xhs_success_page(before_url, after_url):
         before, after = urlsplit(before_url), urlsplit(after_url)
     except (TypeError, ValueError):
         return False
-    return (
-        before.geturl() != after.geturl()
-        and after.hostname == "creator.xiaohongshu.com"
-        and after.path == _XHS_SUCCESS_PATH
-        and bool(after.query)
-    )
+    if (before.geturl() == after.geturl() or before.scheme != 'https' or after.scheme != 'https'
+            or before.netloc != 'creator.xiaohongshu.com' or after.netloc != before.netloc
+            or before.path != '/publish/publish' or before.fragment or after.fragment
+            or _looks_like_existing_draft_or_edit(before_url) or _looks_like_existing_draft_or_edit(after_url)):
+        return False
+    before_query = parse_qs(before.query, keep_blank_values=True)
+    if (set(before_query) - {'target', 'source'} or before_query.get('target') != ['video']
+            or any(len(values) != 1 for values in before_query.values())):
+        return False
+    if after.path == _XHS_SUCCESS_PATH:
+        return bool(after.query)
+    # Official success chunk1727.9cba91b2.js SHA b928154a... Unicode860:
+    # k() pushes Post(source,published:'true'), after the success page's
+    # countdown (Unicode1516). Current index.240167e3 redirects Post to
+    # newPost (/publish/publish); no draft/edit/target is carried forward.
+    after_query = parse_qs(after.query, keep_blank_values=True)
+    return (after.path == '/publish/publish' and set(after_query) <= {'source', 'published'}
+            and after_query.get('published') == ['true']
+            and all(len(values) == 1 for values in after_query.values()))
+
+
+def _xhs_native_submit_url(url):
+    # Current official Vue bc75be57... POST_NOTE at Unicode296285, pG=v
+    # at1289564 and production v() at1290622. This is a receipt observation
+    # predicate; it does not itself authorize or send the native POST.
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme == 'https' and parsed.netloc == 'edith.xiaohongshu.com'
+                and parsed.path == '/web_api/sns/v2/note' and not parsed.fragment)
+    except (TypeError, ValueError):
+        return False
+
+
+def _xhs_receipt_scope(page, expected, account, frame):
+    session = getattr(page, '_sau_draft_evidence', None)
+    values = getattr(session, 'expected', {})
+    if (session is None or session.page is not page or session.closed or session.platform != 'xiaohongshu'
+            or frame is not page.main_frame or expected.get('workflow_action') != 'publish'
+            or not expected.get('job_id') or not expected.get('receipt_nonce')
+            or any(values.get(key) != expected.get(key) for key in ('job_id', 'receipt_nonce', 'workflow_action'))
+            or account.get('verified') is not True or not account.get('identity')
+            or account.get('identity') != values.get('account', {}).get('identity')):
+        return None
+    return {'session': session, 'job_id': expected['job_id'], 'receipt_nonce': expected['receipt_nonce'],
+            'account': copy.deepcopy(account)}
+
+
+async def _xhs_observed_success_page(page, observation, before_url):
+    scope = observation.receipt_scope
+    if (observation.platform != 'xiaohongshu' or not isinstance(scope, dict)
+            or len(observation.requests) != 1 or len(observation.responses) != 1
+            or type(observation.responses[0].get('http_status')) is not int
+            or not 200 <= observation.responses[0]['http_status'] < 300
+            or not _xhs_success_page(before_url, getattr(page, 'url', ''))):
+        return False
+    session = scope['session']
+    url, frame = page.url, page.main_frame
+
+    def current():
+        return (getattr(page, '_sau_draft_evidence', None) is session and session.page is page
+                and not session.closed and session.platform == 'xiaohongshu'
+                and page.main_frame is frame and frame is observation.frame and frame.url == page.url
+                and page.url == url and session.expected.get('job_id') == scope['job_id']
+                and session.expected.get('receipt_nonce') == scope['receipt_nonce']
+                and session.expected.get('workflow_action') == 'publish'
+                and session.account.get('identity') == scope['account']['identity']
+                and (not scope['account'].get('uid') or
+                     str(session.account.get('uid')) == str(scope['account']['uid'])))
+    if not current():
+        return False
+    try:
+        account = await asyncio.wait_for(inspect_session('xiaohongshu', page), timeout=2)
+        return (current() and isinstance(account, dict) and account.get('verified') is True
+                and account.get('identity') == scope['account']['identity']
+                and (not scope['account'].get('uid') or str(account.get('uid')) == str(scope['account']['uid'])))
+    except Exception:
+        return False
 
 
 async def _wait_for_receipt(page, observation, before_url, timeout):
@@ -471,7 +748,7 @@ async def _wait_for_receipt(page, observation, before_url, timeout):
         if observation.tasks:
             await asyncio.gather(*tuple(observation.tasks), return_exceptions=True)
             observation.tasks.clear()
-        if _xhs_success_page(before_url, getattr(page, "url", "")):
+        if await _xhs_observed_success_page(page, observation, before_url):
             return {"kind": "success_page", "platform": "xiaohongshu"}
         # A unique, documented API ID proves the submission was accepted. It
         # still says nothing about review completion or public visibility.
@@ -495,7 +772,7 @@ async def _wait_for_receipt(page, observation, before_url, timeout):
     if observation.tasks:
         await asyncio.gather(*tuple(observation.tasks), return_exceptions=True)
         observation.tasks.clear()
-    if _xhs_success_page(before_url, getattr(page, "url", "")):
+    if await _xhs_observed_success_page(page, observation, before_url):
         return {"kind": "success_page", "platform": "xiaohongshu"}
     if len(observation.requests) == len(observation.responses) == 1:
         response = observation.responses[0]
@@ -582,6 +859,8 @@ async def publish_current(page, platform, expected=None, *, before_click=None, p
 
     before_url = getattr(page, "url", "")
     observation = _Observation(candidate.frame, platform)
+    if platform == 'xiaohongshu':
+        observation.receipt_scope = _xhs_receipt_scope(page, expected, account, candidate.frame)
     try:
         handlers = _bind_observer(page, observation)
     except Exception:
@@ -606,6 +885,20 @@ async def publish_current(page, platform, expected=None, *, before_click=None, p
             await _emit(progress, platform, "submit", "running", "single_click")
             try:
                 await candidate.control.click(timeout=8000)
+                if platform == 'kuaishou' and not observation.requests:
+                    # The creator's first button can open its native confirmation
+                    # dialog. Only its exact confirmation button is the final
+                    # action; the initial button is never clicked again.
+                    modal=candidate.frame.locator('div.ant-modal-confirm-centered:visible')
+                    try:
+                        await modal.first.wait_for(state='visible',timeout=1200)
+                    except Exception:
+                        pass
+                    if await modal.count()==1 and await modal.first.is_visible():
+                        confirms=modal.first.get_by_role('button',name='确认发布',exact=True)
+                        if await confirms.count()!=1 or not await confirms.first.is_visible() or not await confirms.first.is_enabled():
+                            raise RuntimeError('Unknown publication confirmation control')
+                        await confirms.first.click(timeout=8000)
             except Exception:
                 # click() can fail after dispatch; never call it again.
                 await _emit(progress, platform, "submit", "unknown", "click_outcome_unknown")

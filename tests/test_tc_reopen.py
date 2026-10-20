@@ -1,3 +1,4 @@
+import os
 """Isolated ordinary-UI fixtures; no platform account or external requests."""
 import unittest
 import io
@@ -100,7 +101,7 @@ document.querySelector('#draft').onclick=()=>{calls.draft++;cfg.leave?showLeave(
 
 class TcReopenSourceTests(unittest.TestCase):
     def test_official_dom_id_binding_and_normal_edit_leave_contract(self):
-        raw = Path(__file__).resolve().parents[1] / 'research/raw/2026-10-03/limits-login'
+        raw = Path(os.environ.get('SAU_TC_SOURCE_CACHE', str(Path(__file__).resolve().parents[1] / 'research/raw/2026-10-03/limits-login')))
         source = (raw / 'tc-content-755.151a1d93.js').read_text()
         self.assertIn('staticClass:"post-draft-item"', source)
         self.assertIn('this.draftStore.setDraftObjectId(t.objectId)', source)

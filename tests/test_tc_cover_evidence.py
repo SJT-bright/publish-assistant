@@ -133,6 +133,41 @@ class TCCoverFixtureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.js('fixture.getterIdentity&&fixture.cropReceiver===fixture.crop&&fixture.cropArgs[0]==="same-argument"'))
         self.assertTrue(await self.js('fixture.lastPromise.then(v=>v===fixture.results[0])'))
 
+    async def test_freeze_keeps_actual_crop_derived_sha_upload_and_current_role(self):
+        session,observer=await self.install();await self.select(session)
+        data=await self.start();self.sns(session,data);await self.finish(observer)
+        links=observer.upload_links();candidate={'cover_slots':{'cover_landscape':['https://finder.video.qq.com/cropped']}}
+        frozen=observer.freeze_records(candidate,links)
+        self.assertIsNotNone(frozen);self.assertTrue(observer.frozen_current(frozen))
+        self.assertEqual(frozen['cover_landscape']['chain_ids'],links[0]['ids'])
+        self.assertEqual(len(frozen['cover_landscape']['chain_ids']),2)
+        self.assertEqual(frozen['cover_landscape']['record']['derived_sha256'],hashlib.sha256(data).hexdigest())
+        self.assertEqual(frozen['cover_landscape']['record']['derived_size'],len(data))
+        bad=copy.deepcopy(frozen);bad['cover_landscape']['link']['sha256']='0'*64
+        self.assertFalse(observer.frozen_current(bad))
+        self.assertFalse(observer.frozen_current({'cover_landscape':{}}))
+        observer.invalidated['cover_landscape']=time.time()
+        self.assertFalse(observer.frozen_current(frozen))
+        self.assertIsNone(observer.freeze_records(candidate,links))
+
+    async def test_native_uploaded_image_single_identity_freezes_actual_crop_and_full_transport(self):
+        from tests.test_tc_resource import image_resource,ENCRYPTED
+        from uploader.draft_evidence import parse_record
+        image=image_resource(ENCRYPTED)
+        session,observer=await self.install();await self.select(session)
+        data=await self.start();self.sns(session,data,resource=image.replace('https://finder.video.qq.com','http://wxapp.tc.qq.com'))
+        await self.finish(observer,resource=image)
+        candidate=parse_record('tencent',{'objectId':'fixture-id','postReq':{'objectDesc':{'media':[{'shareCoverUrl':image}]}}})
+        links=observer.upload_links();self.assertEqual(len(links),1);self.assertEqual(len(links[0]['ids']),1)
+        self.assertEqual(observer._resources(next(iter(observer.records.values()))),candidate['cover_slots']['cover_landscape'])
+        frozen=observer.freeze_records(candidate,links);self.assertIsNotNone(frozen);self.assertTrue(observer.frozen_current(frozen))
+        self.assertEqual(frozen['cover_landscape']['link'],links[0])
+        for ids in ([],links[0]['ids']*2,['foreign-resource']):
+            bad=copy.deepcopy(candidate);bad['cover_slots']['cover_landscape']=ids
+            self.assertIsNone(observer.freeze_records(bad,links))
+        bad=copy.deepcopy(frozen);bad['cover_landscape']['chain_ids'].append('foreign-resource')
+        self.assertFalse(observer.frozen_current(bad))
+
     async def test_applied_getter_can_update_in_original_vue_microtask(self):
         session,observer=await self.install()
         await self.js('fixture.lateApplied=true')

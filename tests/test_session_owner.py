@@ -66,6 +66,30 @@ class SessionOwnerTests(unittest.IsolatedAsyncioTestCase):
         self.html = f'<!doctype html><meta charset="utf-8"><div id="app"></div>{controls}{extra}<script>{script if script is not None else OWNER_SCRIPTS[platform]}</script>'
         await self.page.goto('https://' + (host or HOSTS[platform]) + '/creator-fixture')
 
+    async def test_kuaishou_empty_bootstrap_waits_for_fresh_owner(self):
+        initial = "document.querySelector('#app').__vue__={$store:{state:{user:{logined:false,userId:0,userName:'',userAvatar:'',userKwaiId:''}}}};"
+        await self.load('kuaishou', initial)
+        owner = await current_owner_state('kuaishou', self.page)
+        self.assertIsNone(owner['owner'])
+        self.assertFalse(owner['loggedOut'])
+        self.assertFalse((await inspect_session('kuaishou', self.page))['verified'])
+        await self.page.evaluate("document.querySelector('#app').__vue__.$store.state.user={logined:true,userId:'ks-owner'}", isolated_context=False)
+        self.assertTrue((await inspect_session('kuaishou', self.page))['verified'])
+        await self.page.evaluate("document.querySelector('#app').__vue__.$store.state.user.logined=false", isolated_context=False)
+        stopped = await inspect_session('kuaishou', self.page)
+        self.assertFalse(stopped['verified'])
+        self.assertEqual(stopped['diagnostic'], 'owner_logged_out')
+
+    async def test_kuaishou_partial_empty_or_false_owner_remains_rejected(self):
+        for script in (
+            "document.querySelector('#app').__vue__={$store:{state:{user:{logined:false,userId:0}}}};",
+            "document.querySelector('#app').__vue__={$store:{state:{user:{logined:false,userId:'old-owner',userName:'',userAvatar:'',userKwaiId:''}}}};",
+        ):
+            await self.load('kuaishou', script)
+            stopped = await inspect_session('kuaishou', self.page)
+            self.assertFalse(stopped['verified'])
+            self.assertEqual(stopped['diagnostic'], 'owner_logged_out')
+
     async def shared_owner(self, platform):
         script = (ROOT / 'ui-assets/session-owner.js').read_text()
         session = await self.context.new_cdp_session(self.page)

@@ -18,6 +18,7 @@ class Element {
   replaceChildren(...values){this.children=[...values];}
   setAttribute(key,value){this.attributes[key]=String(value);}
   getAttribute(key){return this.attributes[key]??null;}
+  removeAttribute(key){delete this.attributes[key];}
   addEventListener(){}
   querySelectorAll(){return this.children.flatMap(child=>[...(child.type==='checkbox'&&child.checked?[child]:[]),...(child.querySelectorAll?.()||[])]);}
   focus(){this.focused=true;}
@@ -42,6 +43,7 @@ async function harness(){
     calls.push({url,body:options?.body?JSON.parse(options.body):null});
     if(handler){const result=handler(url,options);if(result!==undefined)return result;}
     if(url.startsWith('/api/state'))return response(state);
+    if(url==='/api/editor/clear')return response({result:{payload:{},platforms:checkboxes.filter(c=>c.checked).map(c=>c.dataset.platform)}});
     if(url==='/api/preflight')return response({result:preflight()});
     if(url==='/api/text-check')return response({result:{errors:[],feedback:{},summaries:{title:'fixture',description:'fixture',tags:'fixture'}}});
     return response({result:{}});
@@ -50,12 +52,13 @@ async function harness(){
   const opened=[];
   const overrides={...store,refresh:()=>{},setFeedback:()=>{},add:()=>{},open:(...args)=>opened.push(args),
     setField:(...args)=>{store.setField(...args);sandbox.controller?.dirty();}};
-  const sandbox={document,window:{addEventListener:()=>{},TagEditor:{parse:()=>[],attach:()=>({get:()=>commonTags.slice(),set:()=>{},suggest:()=>{}})},
+  const sandbox={document,window:{addEventListener:()=>{},TagEditor:{parse:()=>[],attach:()=>({get:()=>commonTags.slice(),set:values=>{commonTags=values.slice();},suggest:()=>{}})},
     FieldOverrides:{mount:()=>overrides},MaterialEditor:{mount:()=>({update:()=>{}})}},fetch:external,console,Date,Map,
     setTimeout:()=>1,clearTimeout:()=>{},setInterval:()=>1};
   vm.createContext(sandbox);
   vm.runInContext(script+`
-    globalThis.controller={start,refresh,updateTextCheck,renderResults,dirty,updateActions,dateText,openTagChoices,updateTagChoiceCount,
+    globalThis.controller={start,refresh,updateTextCheck,renderResults,dirty,updateActions,dateText,openTagChoices,updateTagChoiceCount,loadVideo,payload,clearCurrentDraft,undoClearDraft,
+      flushEditor:()=>window.flushWorkbenchEditor(),
       platformName:(id,name)=>{platformNames[id]=name;},
       status:()=>({busy,submitting,checking}),retry:(mode,target)=>{retryMode=mode;retryTarget=target;},
       desktop:value=>{window.draftDesktop=value;}};`,sandbox,{filename:'draft_workbench.html'});
@@ -63,6 +66,50 @@ async function harness(){
   return {api:sandbox.controller,elements,calls,login,handler:fn=>{handler=fn;},state:value=>{state={...state,...value};},checkbox,overrides,opened,
     commonTags:values=>{commonTags=values.slice();},select:ids=>{checkboxes=ids.map(platform=>({checked:true,dataset:{platform}}));}};
 }
+test('one click clears homepage material and overrides, preserves platform choice and supports undo',async()=>{
+  const h=await harness();
+  h.elements.title.value='旧标题';h.elements.description.value='完整文案';h.commonTags(['科普']);
+  h.elements.coverLandscape.value='/fixture/横版.png';h.elements.coverPortrait.value='/fixture/竖版.png';
+  h.overrides.set({tencent:{description:'平台文案',tags:['独立话题'],cover:'/fixture/专用.png'}});
+  const previous=plain(h.api.payload());
+  await h.elements.clearDraft.onclick();
+  assert.equal(h.elements.title.value,'');assert.equal(h.elements.description.value,'');
+  assert.equal(h.elements.coverLandscape.value,'');assert.equal(h.elements.coverPortrait.value,'');
+  assert.deepEqual(plain(h.api.payload().tags),[]);assert.deepEqual(plain(h.overrides.get()),{});
+  assert.equal(h.checkbox.checked,true);assert.equal(h.elements.undoClearDraft.hidden,false);
+  assert.deepEqual(h.calls.find(call=>call.url==='/api/editor/clear').body,{platforms:['tencent']});
+  await h.elements.undoClearDraft.onclick();
+  assert.deepEqual(plain(h.api.payload()),previous);assert.equal(h.elements.undoClearDraft.hidden,true);
+  assert.deepEqual(h.calls.filter(call=>call.url==='/api/editor').at(-1).body.payload,previous);
+});
+test('clear waits for an in-flight save, discards stale video imports, and flush cannot restore old content',async()=>{
+  const h=await harness(),saved=deferred(),loaded=deferred(),cleared=deferred();
+  h.elements.title.value='迟到的旧草稿';
+  h.handler(url=>url==='/api/editor'?saved.promise:url==='/api/load'?loaded.promise:url==='/api/editor/clear'?cleared.promise:undefined);
+  const writing=h.api.flushEditor();await flush();
+  const importing=h.api.loadVideo('/fixture/old.mp4');await flush();
+  const clearing=h.elements.clearDraft.onclick();await flush();
+  assert.equal(h.calls.filter(call=>call.url==='/api/editor/clear').length,0);
+  assert.equal(h.elements.save.disabled,true);assert.equal(h.elements.clearDraft.disabled,true);
+  loaded.resolve(response({result:{video:'/fixture/old.mp4',title:'不应恢复'}}));await importing;
+  saved.resolve(response({result:{}}));await writing;await flush();
+  const closing=h.api.flushEditor();
+  assert.equal(h.calls.filter(call=>call.url==='/api/editor').length,1);
+  cleared.resolve(response({result:{payload:{},platforms:['tencent']}}));await clearing;await closing;
+  assert.equal(h.elements.title.value,'');assert.equal(h.api.payload().video,'');
+  assert.equal(h.elements.videoDrop.classList.contains('importing'),false);
+  assert.equal(h.elements.clearDraft.disabled,false);
+});
+test('clearing is blocked during active work and a rejected clear preserves material',async()=>{
+  const h=await harness();h.elements.title.value='需要保留';
+  h.state({job:{id:'active',active:true,action:'draft',results:[],logs:[]}});await h.api.refresh();
+  await h.elements.clearDraft.onclick();assert.equal(h.calls.filter(call=>call.url==='/api/editor/clear').length,0);
+  assert.equal(h.elements.clearDraft.disabled,true);assert.equal(h.elements.title.value,'需要保留');
+  h.state({job:null});await h.api.refresh();
+  h.handler(url=>url==='/api/editor/clear'?Promise.reject(new Error('保存失败')):undefined);
+  await h.elements.clearDraft.onclick();assert.equal(h.elements.title.value,'需要保留');
+  assert.match(h.elements.notice.textContent,/草稿未清空/);assert.equal(h.elements.clearDraft.disabled,false);
+});
 test('preflight and start phases stay locked across idle polls, text checks and duplicate start calls',async()=>{
   const h=await harness(),checked=deferred(),accepted=deferred();
   h.handler(url=>url==='/api/preflight'?checked.promise:url==='/api/start'?accepted.promise:undefined);

@@ -5,6 +5,7 @@ Public source project-publish-vue.474cd180.js chars 681028, 690175,
 324300. Opening/editing a cover never saves or publishes the note.
 """
 import asyncio
+import math
 import re
 
 from uploader.local_files import set_local_files
@@ -14,6 +15,14 @@ MODAL = '.main-cover-editor-modal.cover-modal'
 IMAGE_INPUT = ('.cover-choose-container .upload-slot > label.upload-btn > '
                'input.upload-input[type="file"][accept*="image"]')
 COMPLETE = '.editor-panel .bottom .bottom-content > button.mojito-button'
+MAX_COVER_ENTRY_WAIT_MS = 45000
+MAIN_CARD = '.cover-plugin-preview > .cover > .default:not(.operator)'
+EDIT_ENTRY = '.cover-plugin-preview .cover-edit-entry'
+PK_INTRO_TITLE = 'PK封面新功能引导'
+PK_INTRO_TEXT = ('视频可以PK封面啦，快来试试吧 '
+    '开启后，发现页会给不同观众展示更合适的封面，提升点击率；'
+    '个人主页、笔记分享等仍展示主封面。'
+    '发布满72小时后PK结束，点击率最高的一张会自动成为主封面。')
 
 
 async def _guard(page, guard):
@@ -47,37 +56,93 @@ async def _modal(page, *, required=True):
     return modal
 
 
+async def _dismiss_pk_cover_intro(page, deadline, guard):
+    """Close only the observed named information bubble, never the PK switch."""
+    intro = await _visible_unique(page.main_frame.get_by_label(PK_INTRO_TITLE, exact=True),
+        '小红书出现多个PK封面新功能引导，已保留页面。', required=False)
+    if intro is None:
+        return False
+    title = await intro.evaluate(r"""e => e.getAttribute('aria-label') ||
+        (e.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+        .map(id=>e.ownerDocument.getElementById(id)?.textContent || '').join(' ')""")
+    if ''.join(title.split()) != PK_INTRO_TITLE:
+        return False
+    text = ''.join((await intro.inner_text()).split())
+    if ''.join(PK_INTRO_TEXT.split()) not in text:
+        return False
+    if await intro.locator('input,textarea,[contenteditable="true"]').count():
+        return False
+    button = await _visible_unique(intro.get_by_role('button', name='我知道了', exact=True),
+        '小红书PK封面引导的关闭按钮不唯一，已保留页面。', required=False)
+    if button is None or not await button.is_enabled():
+        return False
+    await _guard(page, guard)
+    remaining = max(1, int((deadline-asyncio.get_running_loop().time()) * 1000))
+    await button.click(timeout=min(1000, remaining))
+    await intro.wait_for(state='hidden', timeout=min(1000, remaining))
+    return True
+
+
 async def open_xhs_cover_editor(page, *, timeout=15000, guard=None):
-    """Reuse one visible main modal or hover the main card and click its entry."""
-    await _guard(page, guard)
-    modal = await _modal(page, required=False)
-    if modal is not None:
-        return modal
-    card = await _visible_unique(page.main_frame.locator(
-        '.cover-plugin-preview > .cover > .default:not(.operator)'),
-        '小红书没有唯一的主封面卡片，已停止以免操作其他封面。')
-    # The card itself has no business click handler. The actual edit action is
-    # revealed by CSS hover and has its own stop-propagation click handler.
-    await card.hover(timeout=timeout)
-    entry = page.main_frame.locator('.cover-plugin-preview .cover-edit-entry').filter(
-        has_text=re.compile(r'^\s*编辑封面\s*$'))
+    """Reacquire the current card after rerenders; open the main modal once.
+
+The video transfer timeout cannot turn this UI wait into a 15-minute loop.
+Hover is retried only before any click is issued. Once the edit click starts,
+an uncertain result stops the helper instead of repeating the business action.
+"""
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError('小红书封面入口必须使用有限的正数等待时间。')
+    timeout = min(timeout, MAX_COVER_ENTRY_WAIT_MS)
     deadline = asyncio.get_running_loop().time() + timeout / 1000
-    while True:
-        candidate = await _visible_unique(entry, '小红书出现多个编辑封面入口。', required=False)
-        if candidate is not None:
-            break
-        if asyncio.get_running_loop().time() >= deadline:
-            raise ValueError('小红书主封面的编辑入口没有出现。')
-        await asyncio.sleep(.05)
+    try:
+        async with asyncio.timeout(timeout / 1000):
+            return await _open_xhs_cover_editor_until(page, deadline, guard)
+    except TimeoutError:
+        raise ValueError('小红书封面入口等待超时，已保留当前视频且不重复导入。') from None
+
+
+async def _open_xhs_cover_editor_until(page, deadline, guard):
     await _guard(page, guard)
-    await candidate.click(timeout=timeout)
+    clicked = False
     while True:
+        await _guard(page, guard)
         modal = await _modal(page, required=False)
         if modal is not None:
             return modal
-        if asyncio.get_running_loop().time() >= deadline:
-            raise ValueError('小红书主封面编辑器没有出现。')
-        await asyncio.sleep(.05)
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise ValueError('小红书主封面的编辑入口或编辑器仍未加载，已保留当前视频。')
+        if clicked:
+            await asyncio.sleep(min(.05, remaining))
+            continue
+        await _dismiss_pk_cover_intro(page, deadline, guard)
+        card = await _visible_unique(page.main_frame.locator(
+            MAIN_CARD),
+            '小红书没有唯一的主封面卡片，已停止以免操作其他封面。', required=False)
+        if card is not None:
+            # A card can be physically replaced, moved or covered between
+            # locator reads. Retry only this non-business pointer action.
+            try:
+                await card.hover(timeout=min(1000, max(1, int(remaining * 1000))))
+            except Exception:
+                await asyncio.sleep(min(.05, max(0, deadline-asyncio.get_running_loop().time())))
+                continue
+            if await _dismiss_pk_cover_intro(page, deadline, guard):
+                continue
+            entry = page.main_frame.locator(EDIT_ENTRY).filter(
+                has_text=re.compile(r'^\s*编辑封面\s*$'))
+            candidate = await _visible_unique(entry, '小红书出现多个编辑封面入口。', required=False)
+            if candidate is not None:
+                await _guard(page, guard)
+                if await _dismiss_pk_cover_intro(page, deadline, guard):
+                    continue
+                clicked = True
+                try:
+                    await candidate.click(timeout=min(1500, max(1, int(
+                        (deadline-asyncio.get_running_loop().time()) * 1000))))
+                except Exception as error:
+                    raise ValueError('小红书封面编辑入口点击结果未确认，已保留页面且不重复点击。') from error
+        await asyncio.sleep(min(.05, max(0, deadline-asyncio.get_running_loop().time())))
 
 
 async def _cover_ready(page):

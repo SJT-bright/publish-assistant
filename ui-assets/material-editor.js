@@ -15,7 +15,7 @@
     const $ = id => document.getElementById(id);
     const player=$('videoPlayer'),seek=$('seek'),time=$('frameTime'),durationLabel=$('videoDuration');
     const status=$('frameStatus'),capture=$('captureFrame'),role=$('captureRole'),ratio=$('captureRatio');
-    let source='',duration=0,sourceVersion=0,selectedTime=0,draggingSeek=false,capturing=false,seekPending=false;
+    let source='',duration=0,sourceVersion=0,selectedTime=0,draggingSeek=false,capturing=false,seekPending=false,captureRequest=0;
     const coverVersion={common:0,landscape:0,portrait:0};
     const shownCover={};
     const fieldVersion={title:0,description:0},textRequest={title:0,description:0};
@@ -62,7 +62,8 @@
       $(field).addEventListener('input',()=>fieldVersion[field]++);
       dropZone(document.querySelector(`[data-text-drop="${field}"]`),data=>applyText(field,()=>data.files.length?readFile(data.files[0],field):Promise.resolve(data.getData('text/plain'))),true);
       document.querySelector(`[data-text-pick="${field}"]`).addEventListener('click',async()=>{
-        try { const path=await pick('text');if(path)await applyText(field,async()=>(await request('/api/import-text',{path,field})).value); } catch(error) { fail(error); }
+        const version=sourceVersion;
+        try { const path=await pick('text');if(path&&version===sourceVersion)await applyText(field,async()=>(await request('/api/import-text',{path,field})).value); } catch(error) { if(version===sourceVersion)fail(error); }
       });
     }
     async function importCover(which,path) {
@@ -89,7 +90,7 @@
       const slot=document.querySelector(`[data-cover-slot="${which}"]`);
       attachCoverActions(which,slot);
       dropZone(slot,async data=>{if(data.files.length)await importCover(which,diskPath(data.files[0]));});
-      slot.querySelector('[data-cover-pick]').addEventListener('click',async()=>{try{const path=await pick('cover');if(path)await importCover(which,path);}catch(error){fail(error);}});
+      slot.querySelector('[data-cover-pick]').addEventListener('click',async()=>{const version=sourceVersion;try{const path=await pick('cover');if(path&&version===sourceVersion)await importCover(which,path);}catch(error){if(version===sourceVersion)fail(error);}});
       slot.querySelector('[data-cover-clear]').addEventListener('click',()=>{coverVersion[which]++;setCover(which,'');notice('');});
     }
     function controls() {
@@ -118,7 +119,7 @@
     player.addEventListener('timeupdate',()=>{if(seekPending)return;if(Number.isFinite(player.currentTime))updateTime(player.currentTime);});
     player.addEventListener('seeked',()=>{seekPending=false;if(Number.isFinite(player.currentTime))updateTime(player.currentTime);});
     player.addEventListener('loadedmetadata',()=>{
-      if(Number.isFinite(player.duration)&&player.duration>0){duration=player.duration;controls();}
+      if(source&&Number.isFinite(player.duration)&&player.duration>0){duration=player.duration;controls();}
     });
     player.addEventListener('error',()=>{if(source)status.textContent='此编码暂时无法在播放器预览，可按秒数截帧；也可重新导出 H.264 MP4。';});
     function restrictRatios() {
@@ -129,16 +130,17 @@
     role.addEventListener('change',restrictRatios);restrictRatios();
     capture.addEventListener('click',async()=>{
       if(capturing||!source||!duration)return;
-      const video=source,version=sourceVersion,which=role.value,coverSeq=coverVersion[which];
+      const video=source,version=sourceVersion,which=role.value,coverSeq=coverVersion[which],sequence=++captureRequest;
       const live=Number.isFinite(player.currentTime)&&!player.error?player.currentTime:selectedTime;
       const timestamp=seekPending?selectedTime:live;
       capturing=true;controls();status.textContent='正在截取 '+timestamp.toFixed(2)+' 秒的画面…';notice('');
       try {
         const frame=await request('/api/frame',{path:video,time:timestamp,role:which,ratio:ratio.value});
+        if(sequence!==captureRequest)return;
         if(version!==sourceVersion || coverSeq!==coverVersion[which]){status.textContent='素材已改变，保留了当前选择。';return;}
         coverVersion[which]++;setCover(which,frame.path,{generated:true,frame});
         status.textContent='已截取 '+frame.time.toFixed(2)+' 秒 · '+frame.width+' × '+frame.height+'，用作'+{common:'通用',landscape:'横版',portrait:'竖版'}[which]+'封面。';
-      } catch(error) {status.textContent='截帧未完成，原素材和封面已保留。';fail(error);} finally {capturing=false;controls();}
+      } catch(error) {if(sequence===captureRequest){status.textContent='截帧未完成，原素材和封面已保留。';fail(error);}} finally {if(sequence===captureRequest){capturing=false;controls();}}
     });
     function update(material) {
       for(const which of Object.keys(coverKey)) {
@@ -161,8 +163,15 @@
       player.src='/media?path='+encodeURIComponent(source);player.load();
       request('/api/media-info',{path:source}).then(info=>{if(version!==sourceVersion)return;duration=Number(info.duration)||0;controls();}).catch(error=>{if(version===sourceVersion){status.textContent='视频信息读取失败，请重新导入。';fail(error);}});
     }
+    function reset() {
+      sourceVersion++;captureRequest++;capturing=false;
+      for(const which of Object.keys(coverKey))coverVersion[which]++;
+      for(const field of Object.keys(fieldVersion)){fieldVersion[field]++;textRequest[field]++;}
+      duration=selectedTime=0;seekPending=draggingSeek=false;seek.value=time.value='0';
+      update({});controls();
+    }
     controls();
-    return {update};
+    return {update,reset};
   }
   window.MaterialEditor={mount};
 })();

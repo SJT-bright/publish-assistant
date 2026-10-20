@@ -40,8 +40,8 @@ def cover_fixture(mode='auto', crop=False, opened='', duplicate=False):
       <input type="file" id="wrong-file" accept="image/png" onchange="record('wrong-file')">
       <button id="wrong-confirm" onclick="record('wrong-confirm')">确认</button>
       <button onclick="record('wrong-crop-confirm')">确定裁剪</button>
-      <div class="horizontal-cover-wrap" onclick="openCover('landscape')">分享卡片 4:3</div>
-      <div class="vertical-cover-wrap" onclick="openCover('portrait')">个人主页卡片 3:4</div>
+      <div class="horizontal-cover-wrap" onclick="openCover('landscape')">分享卡片 4:3<div class="edit-btn">编辑</div></div>
+      <div class="vertical-cover-wrap" onclick="openCover('portrait')">个人主页卡片 3:4<div class="edit-btn edit-btn-zIndex">编辑</div></div>
       ''' + ''.join(dialogs) + '''
       <div class="weui-desktop-dialog" id="crop" style="display:none"><h2>裁剪封面图</h2>
         <div class="weui-desktop-dialog__ft"></div>
@@ -99,8 +99,8 @@ def recommendation_fixture(mode='single', modal_delay=400):
     Share uses recommend-img-vertical and openEditDialogDirectly(true). Popovers
     are children of cover-preview-wrap via the official getPopupContainer.
     """
-    original = '''<div class="horizontal-cover-wrap" onclick="openCover('landscape')">分享卡片 4:3</div>
-      <div class="vertical-cover-wrap" onclick="openCover('portrait')">个人主页卡片 3:4</div>'''
+    original = '''<div class="horizontal-cover-wrap" onclick="openCover('landscape')">分享卡片 4:3<div class="edit-btn">编辑</div></div>
+      <div class="vertical-cover-wrap" onclick="openCover('portrait')">个人主页卡片 3:4<div class="edit-btn edit-btn-zIndex">编辑</div></div>'''
     cards = '''<div class="cover-preview-wrap">
       <div class="horizon-cover-wrap" onclick="recommendCover('landscape',event)">分享卡片 4:3<div class="edit-btn">编辑</div></div>
       <div class="vertical-cover-wrap" onclick="recommendCover('portrait',event)">个人主页卡片 3:4<div class="edit-btn edit-btn-zIndex">编辑</div></div>
@@ -405,6 +405,15 @@ class TencentRecommendationPopoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_share_recommendation_enters_share_editor_once_without_reusing_profile_cover(self):
         await self.assert_successful_direct_editor('landscape')
 
+    async def test_native_edit_controls_accept_done_video_without_automatic_thumb(self):
+        await self.page.set_content(recommendation_fixture())
+        read=AsyncMock(return_value=self.ready_state(all_cover_cropped=False))
+        with patch('uploader.tc_editor.read_tc_material_state',read):
+            dialog=await self.open_requested('landscape')
+        self.assertTrue(await dialog.is_visible())
+        self.assertEqual([event['type'] for event in await self.events()], ['slot','recommend','direct','open'])
+        read.assert_awaited_once_with(self.page)
+
     async def test_duplicate_requested_recommendation_and_both_directions_stop_before_direct_edit(self):
         for mode in ('duplicate', 'both'):
             for orientation in ('portrait', 'landscape'):
@@ -424,7 +433,7 @@ class TencentRecommendationPopoverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pending_or_unrecognized_material_stops_before_direct_edit_for_each_direction(self):
         states = [self.ready_state(recognized=False), self.ready_state(done_count=0, all_uploaded=False),
-                  self.ready_state(all_cover_cropped=False), self.ready_state(count=2, video_count=2, done_count=2)]
+                  self.ready_state(count=2, video_count=2, done_count=2)]
         for state in states:
             for orientation in ('portrait', 'landscape'):
                 with self.subTest(state=state, orientation=orientation):
@@ -440,6 +449,56 @@ class TencentRecommendationPopoverTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(await self.page.locator('#portrait').is_visible())
                     self.assertFalse(await self.page.locator('#landscape').is_visible())
                     read.assert_awaited_once_with(self.page)
+
+
+class TencentCoverReadinessTests(unittest.IsolatedAsyncioTestCase):
+    asyncSetUp= TencentCurrentCoverTests.asyncSetUp
+    asyncTearDown= TencentCurrentCoverTests.asyncTearDown
+    events= TencentCurrentCoverTests.events
+
+    async def test_loading_card_waits_then_uses_one_normal_native_click_and_import(self):
+        await self.page.set_content(cover_fixture())
+        self.uploader.thumbnail_portrait_path=None
+        await self.page.evaluate("()=>{const card=document.querySelector('.horizontal-cover-wrap');card.querySelector('.edit-btn').style.display='none';const loading=document.createElement('div');loading.className='loading-wrap';loading.textContent='生成中';card.append(loading);Object.defineProperty(card,'__vue__',{get(){throw Error('business getter read');}});}",isolated_context=False)
+        task=asyncio.create_task(self.uploader.set_thumbnail(self.page))
+        try:
+            await asyncio.sleep(.25)
+            self.assertEqual(await self.events(),[])
+            self.assertEqual(self.uploader._draft_cover_phase,'等待平台封面控件准备')
+            await self.page.evaluate("()=>{const card=document.querySelector('.horizontal-cover-wrap');card.querySelector('.loading-wrap').remove();card.querySelector('.edit-btn').style.display='';}",isolated_context=False)
+            await asyncio.wait_for(task,10)
+            kinds=[event['type'] for event in await self.events()]
+            self.assertEqual(kinds.count('open'),1)
+            self.assertEqual(kinds.count('file'),1)
+            self.assertEqual(kinds.count('confirm'),1)
+        finally:
+            if not task.done():task.cancel()
+            await asyncio.gather(task,return_exceptions=True)
+
+    async def test_native_mask_disabled_or_duplicate_edit_marker_times_out_without_action(self):
+        for mode in ('loading','mask','disabled','pointer','duplicate-edit'):
+            with self.subTest(mode=mode):
+                await self.page.set_content(cover_fixture())
+                self.uploader.thumbnail_portrait_path=None
+                self.uploader.draft_cover_ready_timeout=.2
+                await self.page.evaluate("mode=>{const card=document.querySelector('.horizontal-cover-wrap');if(mode==='disabled')card.setAttribute('aria-disabled','true');else if(mode==='pointer')card.style.pointerEvents='none';else if(mode==='duplicate-edit')card.append(card.querySelector('.edit-btn').cloneNode(true));else {const mask=document.createElement('div');mask.className=mode==='mask'?'horizon-mask-layer':'loading-wrap';mask.textContent='生成中';card.append(mask);}}",mode,isolated_context=False)
+                with self.assertRaisesRegex(RuntimeError,'封面控件仍在生成或不可编辑'):
+                    await self.uploader.set_thumbnail(self.page)
+                self.assertEqual(await self.events(),[])
+
+    async def test_failed_changed_and_pending_binding_never_open_ready_cover_controls(self):
+        for state in ('failed','changed','pending','uploading'):
+            with self.subTest(state=state):
+                await self.page.set_content(cover_fixture())
+                self.uploader.thumbnail_portrait_path=None
+                self.uploader.draft_cover_ready_timeout=.2
+                self.page._sau_tc_native_import=object()
+                read=AsyncMock(return_value=state)
+                with patch('uploader.tc_pipeline.read_tc_upload_binding',read):
+                    with self.assertRaises(RuntimeError):
+                        await self.uploader.set_thumbnail(self.page)
+                self.assertEqual(await self.events(),[])
+        del self.page._sau_tc_native_import
 
 
 if __name__ == '__main__':

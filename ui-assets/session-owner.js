@@ -157,6 +157,12 @@
     logged = user?.logined;
     uid = user?.userId;
     source = 'kuaishou-owner-store';
+    // Official 6551.e689a430 module initializes this empty store before its
+    // normal owner request. It is pending authentication, never an owner or
+    // a logout receipt. A false flag on a populated owner still stops below.
+    if (logged === false && uid === 0 && user.userName === '' &&
+        user.userAvatar === '' && user.userKwaiId === '')
+      return {owner:null,loggedOut:false,source:'kuaishou-owner-loading'};
   } else if (platform === 'bilibili') {
     user = state?.upInfo;
     logged = user?.isLogin;

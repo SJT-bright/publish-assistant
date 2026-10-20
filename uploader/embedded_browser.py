@@ -42,6 +42,7 @@ class EmbeddedBrowser:
         self.action = action
         self.lease = None
         self.browser = self.context = self.page = None
+        self._publication_permit_requested = False
 
     async def connect(self, playwright):
         info = await asyncio.to_thread(bridge_request, '/prepare', {'platform': self.platform, 'action': self.action})
@@ -58,6 +59,7 @@ class EmbeddedBrowser:
                         if target['targetInfo']['targetId'] == info['targetId']:
                             self.page, self.context = page, context
                             page._sau_local_files = True
+                            page._sau_embedded_handle = self
                             return self
                     finally:
                         await cdp.detach()
@@ -69,8 +71,43 @@ class EmbeddedBrowser:
     async def release(self):
         # The app owns this browser/context/page. Playwright.stop only disconnects the client.
         if self.lease:
-            lease, self.lease = self.lease, None
-            await asyncio.to_thread(bridge_request, '/finished', {'lease': lease})
+            lease = self.lease
+            try:
+                if self._publication_permit_requested:
+                    await self.revoke_publication()
+            finally:
+                try:
+                    await asyncio.to_thread(bridge_request, '/finished', {'lease': lease})
+                finally:
+                    self.lease = None
+                    if getattr(self.page, '_sau_embedded_handle', None) is self:
+                        self.page._sau_embedded_handle = None
+
+    async def allow_publication(self):
+        """Request a short final-submit permit for this exact publish lease."""
+        if (self.action != 'publish' or not self.lease or self.page is None or
+                getattr(self.page, '_sau_embedded_handle', None) is not self):
+            raise RuntimeError('当前内嵌任务没有最终投稿权限。')
+        # Even an uncertain bridge response needs an explicit revoke attempt.
+        self._publication_permit_requested = True
+        result = await asyncio.to_thread(bridge_request, '/publish-permit',
+                                        {'lease': self.lease, 'platform': self.platform})
+        if not isinstance(result, dict) or result.get('ok') is not True:
+            raise RuntimeError('应用未授予本次任务的最终投稿权限。')
+        return True
+
+    async def revoke_publication(self):
+        """Restore protection on this lease without touching other pages."""
+        if not self._publication_permit_requested:
+            return True
+        if not self.lease:
+            raise RuntimeError('最终投稿权限所属会话已失效。')
+        result = await asyncio.to_thread(bridge_request, '/publish-revoke',
+                                        {'lease': self.lease, 'platform': self.platform})
+        if not isinstance(result, dict) or result.get('ok') is not True:
+            raise RuntimeError('应用未确认恢复本次任务的投稿保护。')
+        self._publication_permit_requested = False
+        return True
 
     def mark_login(self, account=None, status='login_verified'):
         file = embedded_account_file(self.platform)

@@ -385,7 +385,10 @@ class DouYinBaseUploader(BaseVideoUploader):
                 raise ValueError("抖音标题超过 30 字，草稿任务不会截断标题。")
             await assert_draft_safe(page, "抖音")
             scope = None
-            deadline = asyncio.get_running_loop().time() + 30
+            # Some editor variants mount fields during transfer, others after
+            # processing. Poll independently of the upload observation so an
+            # available form can be filled immediately in either variant.
+            deadline = asyncio.get_running_loop().time() + getattr(self, 'draft_upload_timeout', 900)
             while asyncio.get_running_loop().time() < deadline:
                 await assert_draft_safe(page, "抖音")
                 forms = []
@@ -400,6 +403,8 @@ class DouYinBaseUploader(BaseVideoUploader):
                 await asyncio.sleep(.25)
             if scope is None:
                 raise RuntimeError("等待抖音标题/正文组件超时，草稿任务已停止。")
+            from uploader.dy_upload_ready import dismiss_dy_video_preview_tip
+            await dismiss_dy_video_preview_tip(page)
             title_input = scope.locator('input[placeholder*="填写作品标题"]:visible').first
             with progress_part("content", "title"):
                 await title_input.fill(title)
@@ -416,6 +421,7 @@ class DouYinBaseUploader(BaseVideoUploader):
             # literal '*' at the next paragraph. Enter paragraphs through the
             # normal keyboard handler so both model and DOM receive each break.
             with progress_part("content", "description"):
+                await dismiss_dy_video_preview_tip(page)
                 await editor.click()
                 await editor.press("ControlOrMeta+A")
                 await page.keyboard.press("Backspace")
@@ -1046,6 +1052,8 @@ class DouYinVideo(DouYinBaseUploader):
         if not any(path for _, _, path in covers):
             return
         await assert_draft_safe(page, "抖音")
+        from uploader.dy_upload_ready import dismiss_dy_video_preview_tip
+        await dismiss_dy_video_preview_tip(page)
         scope = page
         for frame in page.frames:
             if await frame.locator('input[placeholder*="填写作品标题"]:visible').count() and await frame.locator('div.zone-container[contenteditable="true"]:visible').count():
@@ -1140,10 +1148,54 @@ class DouYinVideo(DouYinBaseUploader):
                     raise RuntimeError("抖音封面上传完成回执未通过核对，已保留当前视频。")
         await assert_draft_safe(page, "抖音")
 
+    async def _verify_draft_text_after_upload(self, page: Page) -> None:
+        """Check the joined result without repeating any editor write."""
+        from uploader.draft_only import assert_draft_safe
+        await assert_draft_safe(page, "抖音")
+        forms = [frame for frame in page.frames
+                 if await frame.locator('input[placeholder*="填写作品标题"]:visible').count() == 1 and
+                    await frame.locator('div.zone-container[contenteditable="true"]:visible').count() == 1]
+        if len(forms) != 1:
+            raise RuntimeError("抖音最终标题/正文组件未唯一确认，已保留素材。")
+        final_title = await forms[0].locator('input[placeholder*="填写作品标题"]:visible').first.input_value()
+        final_caption = await forms[0].locator('div.zone-container[contenteditable="true"]:visible').first.inner_text()
+        caption = (getattr(self, "draft_expected", None) or {}).get("platform_fields", {}).get("caption")
+        if caption is None:
+            caption = self.desc or ""
+            if self.tags:
+                caption += ("\n" if caption else "") + " ".join("#" + tag for tag in self.tags)
+        if final_title != self.title or normalize_douyin_editor_text(final_caption) != normalize_douyin_editor_text(caption):
+            raise RuntimeError("抖音上传完成后的标题或正文回读不一致，已保留素材；未提交。")
+
     async def _upload_draft_content(self, page: Page) -> None:
         from platform_limits import assert_adapter_draft_text
         assert_adapter_draft_text("douyin", self)
-        from uploader.draft_only import assert_draft_safe, save_draft, wait_draft_upload, draft_resume_active, checkpoint_after_upload
+        from uploader.draft_only import assert_draft_safe, save_draft, draft_resume_active, checkpoint_after_upload
+        from uploader.dy_upload_ready import wait_dy_video_uploaded
+        from uploader.upload_pipeline import run_upload_pipeline
+
+        async def prepare_content():
+            with progress_step("content", operations=["title", "description", "readback"]):
+                await self.fill_title_and_description(page, self.title, self.desc, self.tags)
+                if self.productLink or self.productTitle:
+                    raise RuntimeError("草稿模式尚未验证商品字段，已停止以免丢失字段。")
+            if self.thumbnail_portrait_path or self.thumbnail_landscape_path:
+                cover_operations = []
+                if self.thumbnail_portrait_path:
+                    cover_operations.append("portrait")
+                if self.thumbnail_landscape_path:
+                    cover_operations.append("landscape")
+                with progress_step("cover", operations=cover_operations):
+                    await self.set_thumbnail(page)
+            else:
+                emit_progress("cover", "skipped")
+
+        async def observe_upload():
+            with progress_step("upload", operations=["transfer"]):
+                with progress_part("upload", "transfer"):
+                    await wait_dy_video_uploaded(page, timeout=getattr(self, "draft_upload_timeout", 900))
+            await checkpoint_after_upload(page)
+
         if not draft_resume_active(page):
             with progress_step("video", operations=["locate", "select"]):
                 await assert_draft_safe(page, "抖音")
@@ -1164,28 +1216,14 @@ class DouYinVideo(DouYinBaseUploader):
                     if observer is None or not await observer.ensure_ready(timeout=10):
                         raise RuntimeError("抖音上传完成观察器尚未连接，已在导入视频前停止并保留现场。")
                     await set_local_files(page, upload_input, self.file_path)
-            with progress_step("upload", operations=["transfer"]):
-                with progress_part("upload", "transfer"):
-                    await wait_draft_upload(page, "抖音", [
-                        '[class^="long-card"] div:has-text("重新上传")',
-                        ':text-is("上传成功")', ':text-is("视频上传成功")'
-                    ], [':text("上传中")', ':text("转码中")', ':text("处理中")'], timeout=getattr(self, "draft_upload_timeout", 900))
-        await checkpoint_after_upload(page)
-        with progress_step("content", operations=["title", "description", "readback"]):
-            await self.fill_title_and_description(page, self.title, self.desc, self.tags)
-            if self.productLink or self.productTitle:
-                raise RuntimeError("草稿模式尚未验证商品字段，已停止以免丢失字段。")
-        if self.thumbnail_portrait_path or self.thumbnail_landscape_path:
-            cover_operations = []
-            if self.thumbnail_portrait_path:
-                cover_operations.append("portrait")
-            if self.thumbnail_landscape_path:
-                cover_operations.append("landscape")
-            with progress_step("cover", operations=cover_operations):
-                await self.set_thumbnail(page)
+            await run_upload_pipeline(page, "douyin", observe_upload, prepare_content)
         else:
-            emit_progress("cover", "skipped")
+            await checkpoint_after_upload(page)
+            await prepare_content()
         await assert_draft_safe(page, "抖音")
+        # Transfer completion can remount the native editor. Check again after
+        # both lanes join so an earlier successful edit cannot mask a reset.
+        await self._verify_draft_text_after_upload(page)
         await save_draft(page, "抖音", self.title, getattr(self, "draft_receipt", None), expected=getattr(self, "draft_expected", None))
 
     async def upload(self, playwright: Playwright) -> None:

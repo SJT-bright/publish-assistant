@@ -150,7 +150,13 @@ class DouyinDraftRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await self.load_case('composer')
         self.page._sau_draft_evidence = SimpleNamespace(closed=False, _checkpoint_restored_at=123.0)
         app = self.uploader(sealed=True)
-        app.fill_title_and_description = AsyncMock()
+        await self.page.evaluate('''() => {
+            const title=document.createElement('input');title.placeholder='填写作品标题';
+            const body=document.createElement('div');body.className='zone-container';
+            body.contentEditable='true';body.style.minHeight='40px';
+            document.body.append(title,body);
+        }''')
+        app.fill_title_and_description = AsyncMock(wraps=app.fill_title_and_description)
         app.thumbnail_portrait_path = None
         app.thumbnail_landscape_path = None
         goto = AsyncMock(wraps=self.page.goto)

@@ -218,12 +218,7 @@ class ExecutionCheckpoint:
                     'selected_asset_bound': session._tc_selected_asset(item) is not None,
                     'has_video_size': any(a['kind'] == 'video' and a['size'] == item['metadata'][1] for a in session.assets.values())
                   } for item in getattr(session, 'exchanges', []) if 'plan' in item],
-                  'tc_chain_checks': [{
-                    'part_count_matches_plan': len(item['parts']) == len(allocation['plan']),
-                    'part_etags_match': {part['part_number']: {part['etag']} for part in session.exchanges if 'part_number' in part and part['task_id'] == item['task_id'] and part['upload_id'] == item['upload_id']} == {number: {etag} for number, etag in item['parts']},
-                    'part_flag_matches': any(part.get('trans_flag') == item.get('trans_flag') for part in session.exchanges if 'part_number' in part and part['task_id'] == item['task_id'] and part['upload_id'] == item['upload_id']),
-                    'part_flags_present': sum(part.get('trans_flag') is not None for part in session.exchanges if 'part_number' in part and part['task_id'] == item['task_id'] and part['upload_id'] == item['upload_id'])
-                  } for item in getattr(session, 'exchanges', []) if item.get('tc_protocol') == 'dfs' and item.get('stage') == 'complete' for allocation in session.exchanges if 'plan' in allocation and allocation['task_id'] == item['task_id'] and allocation['upload_id'] == item['upload_id']],
+                  'tc_chain_checks': session.tc_upload_chain_diagnostics(),
                   'xhs_sdk_records': len(getattr(getattr(session, 'xhs_observer', None), 'records', {}))}), flush=True)
             return False
 
@@ -456,19 +451,22 @@ async def bilibili_draft(payload, receipt, embedded=False, page=None):
             progress_operation('video', 'select')
             await set_local_files(page, video, payload['video'])
             progress_operation('video', 'select', 'completed')
-        with progress_step("upload"):
-            await bili_wait_uploaded(page, timeout=600)
+        from uploader.bili_pipeline import bili_prepare_upload
+        await bili_prepare_upload(page, payload['title'], payload.get('description', ''), payload.get('tags', []),
+                                  cover=payload.get('cover') or payload.get('cover_landscape'), timeout=600)
+    else:
+        with progress_step("content"):
+            await bili_fill_content(page, payload['title'], payload.get('description', ''), payload.get('tags', []))
     await checkpoint_after_upload(page)
-    with progress_step("content"):
-        await bili_fill_content(page, payload['title'], payload.get('description', ''), payload.get('tags', []))
     # Bili normalizes a single selected source into its official 4:3 home and
     # 16:9 space covers; it does not have a portrait cover slot.
     cover = payload.get('cover') or payload.get('cover_landscape')
-    if cover:
-        with progress_step("cover"):
-            await bili_set_cover(page, cover)
-    else:
-        emit_progress('cover', 'skipped')
+    if draft_resume_active(page):
+        if cover:
+            with progress_step("cover"):
+                await bili_set_cover(page, cover)
+        else:
+            emit_progress('cover', 'skipped')
     await assert_draft_safe(page, 'B站')
     return await save_draft(page, 'B站', payload['title'], receipt, expected=payload)
 
@@ -514,7 +512,7 @@ async def prepared_draft_session(platform, payload, embedded, *, checkpoint_key_
                     _session_diagnostic(phase, 'completed')
                     phase = 'browser_connect'
                     _session_diagnostic(phase, 'running')
-                    connection = await resources.enter_async_context(browser_session(platform, embedded, action='draft'))
+                    connection = await resources.enter_async_context(browser_session(platform, embedded, action=expected.get('workflow_action', 'draft')))
                     p, _, context, page, handle = connection
                     _session_diagnostic(phase, 'completed')
                     if resume_checkpoint is None:
@@ -537,10 +535,11 @@ async def prepared_draft_session(platform, payload, embedded, *, checkpoint_key_
                     if text_check['errors']:
                         raise ValueError('当前平台配置预检未通过；尚未上传：' + '；'.join(e['message'] for e in text_check['errors']))
                     old_owner = read_marker(platform, embedded).get('account', {}).get('identity')
-                    if old_owner and old_owner != account['identity']:
-                        raise DraftInterrupted('当前账号与任务使用的登录记录不同，素材已保留。', 'needs_reauthentication')
-                    if expected.get('expected_account_identity') and expected['expected_account_identity'] != account['identity']:
-                        raise DraftInterrupted('当前账号与任务预检的账号不同，已停止且不上传。', 'needs_reauthentication')
+                    expected_owner = expected.get('expected_account_identity')
+                    if expected_owner and expected_owner != account['identity']:
+                        raise DraftInterrupted('当前已登录账号与本次预检账号不同，请重新核对当前账号；素材已保留且未上传。', 'account_mismatch')
+                    if not expected_owner and old_owner and old_owner != account['identity']:
+                        raise DraftInterrupted('当前已登录账号与旧登录记录不同，请先验证当前账号；素材已保留且未上传。', 'account_mismatch')
                     expected['account'] = account
                     write_marker(platform, account, handle)
                     _session_diagnostic(phase, 'completed')
@@ -640,9 +639,10 @@ async def stage(platform, payload, receipt, embedded=False, *, checkpoint_key_fi
                 result = json.loads(Path(receipt).read_text(encoding='utf-8')) if Path(receipt).is_file() else None
             if not result:
                 raise DraftInterrupted('任务结束但没有本次草稿证据，保留现场且不重传。')
-            from workbench_model import validate_receipt
+            from workbench_model import validate_receipt, validate_publication_receipt
             try:
-                validate_receipt(result, expected, platform)
+                validator = validate_publication_receipt if expected.get('workflow_action') == 'publish' else validate_receipt
+                validator(result, expected, platform)
             except Exception:
                 emit_progress("verify", "failed")
                 raise
@@ -655,7 +655,7 @@ def failure_receipt(payload, platform, path, error):
     if status not in RESULT_STATUSES:
         status = 'result_unknown'
     data = {k: payload.get(k) for k in IDENTITY_FIELDS}
-    data.update(status=status, platform_id=platform, message=str(error), verified_at=time.time(),
+    data.update(workflow_action=payload.get('workflow_action', 'draft'), status=status, platform_id=platform, message=str(error), verified_at=time.time(),
                 verification={k: False for k in ('upload_complete', 'fields', 'cover', 'media', 'reopened', 'account')})
     file = Path(path)
     file.parent.mkdir(parents=True, exist_ok=True)
@@ -667,8 +667,8 @@ def failure_receipt(payload, platform, path, error):
 
 
 async def main():
-    parser = argparse.ArgumentParser(description='仅登录或保存视频草稿')
-    parser.add_argument('action', choices=['login', 'draft'])
+    parser = argparse.ArgumentParser(description='登录、上传并保存草稿或提交投稿')
+    parser.add_argument('action', choices=['login', 'draft', 'publish'])
     parser.add_argument('--platform', required=True, choices=list(PLATFORMS))
     parser.add_argument('--payload')
     parser.add_argument('--receipt')
@@ -681,13 +681,18 @@ async def main():
         await login(args.platform, args.embedded)
     else:
         if not args.payload or not args.receipt:
-            parser.error('draft requires --payload and --receipt')
+            parser.error('draft/publish requires --payload and --receipt')
         payload = json.loads(Path(args.payload).read_text(encoding='utf-8'))
+        if args.action == 'publish':
+            if payload.get('workflow_action') != 'publish':
+                parser.error('publish requires a bound publication payload')
+        elif payload.get('workflow_action') == 'publish':
+            parser.error('draft cannot execute a publication payload')
         try:
             result = await stage(args.platform, payload, args.receipt, args.embedded,
                                  checkpoint_key_file=args.checkpoint_key_file, checkpoint_output=args.checkpoint_output,
                                  resume_checkpoint=args.resume_checkpoint)
-            if result['status'] not in ('local_draft_verified', 'platform_draft_verified', 'platform_snapshot_verified'):
+            if result['status'] not in ('local_draft_verified', 'platform_draft_verified', 'platform_snapshot_verified', 'published_submission_verified'):
                 raise SystemExit(2)
         except Exception as exc:
             failure_receipt(payload, args.platform, args.receipt, exc)

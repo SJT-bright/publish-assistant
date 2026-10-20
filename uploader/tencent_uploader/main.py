@@ -682,7 +682,31 @@ class TencentBaseUploader(BaseVideoUploader):
                     if selected_input is None:
                         raise RuntimeError("未找到视频号视频上传组件，草稿任务已停止。")
                 with progress_part("video", "select"):
-                    await set_local_files(page, selected_input, file_path)
+                    from uploader.tc_pipeline import capture_tc_upload, release_tc_upload
+                    from uploader.tc_stage import create_tc_native_stage, release_tc_native_stage, stage_recovery_roots
+                    previous=getattr(page,'_sau_tc_native_import',None)
+                    await release_tc_upload(previous)
+                    await release_tc_native_stage(getattr(page,'_sau_tc_native_stage',None))
+                    page._sau_tc_native_import=None
+                    page._sau_tc_native_stage=None
+                    page._sau_local_file_phase='准备本次视频副本'
+                    roots=stage_recovery_roots(page)
+                    scope={key:session.expected.get(key) for key in ('job_id','receipt_nonce')}
+                    stage=await create_tc_native_stage(file_path,session.assets.get('video'),
+                        recovery_root=roots[-1] if roots else None,scope=scope)
+                    page._sau_tc_native_stage=stage
+                    try:
+                        page._sau_tc_native_import=await capture_tc_upload(page,selected_input)
+                        page._sau_tc_native_import._sau_tc_native_stage=stage
+                        stage.assert_current()
+                        await set_local_files(page, selected_input, stage.path)
+                        stage.assert_current()
+                    except BaseException:
+                        await release_tc_upload(page._sau_tc_native_import)
+                        await release_tc_native_stage(stage)
+                        page._sau_tc_native_import=None
+                        page._sau_tc_native_stage=None
+                        raise
                 return
         async def find_file_input():
             for fr in page.frames:  # 主 frame + 所有 iframe（视频号编辑器可能在 iframe 内）
@@ -738,7 +762,9 @@ class TencentBaseUploader(BaseVideoUploader):
     async def set_short_title(self, page: Page, title: str, short_title: str | None = None) -> None:
         if getattr(self, "draft_only", False):
             from uploader.draft_only import assert_draft_safe
+            from uploader.tc_pipeline import require_tc_upload_context
             await assert_draft_safe(page, "视频号")
+            await require_tc_upload_context(page)
             # Optional short title stays optional; never derive, pad or truncate it.
             if not short_title:
                 return
@@ -914,6 +940,7 @@ class TencentBaseUploader(BaseVideoUploader):
         if getattr(self, "draft_only", False):
             from uploader.draft_only import assert_draft_safe
             from uploader.tc_editor import read_tc_material_state
+            from uploader.tc_pipeline import read_tc_upload_binding
             with progress_step("upload", operations=["transfer", "processing"]):
                 deadline = time.monotonic() + getattr(self, "draft_upload_timeout", min(timeout_seconds, 900))
                 transfer_complete = False
@@ -922,6 +949,12 @@ class TencentBaseUploader(BaseVideoUploader):
                     while time.monotonic() < deadline:
                         await assert_draft_safe(page, "视频号")
                         state = await read_tc_material_state(page)
+                        binding=getattr(page,'_sau_tc_native_import',None)
+                        bound_state=await read_tc_upload_binding(binding) if binding is not None else None
+                        if bound_state=='failed':
+                            raise RuntimeError("视频号本次上传已失败，已停止且不重复导入视频。")
+                        if bound_state=='changed':
+                            raise RuntimeError("视频号当前素材与本次导入的视频不一致，已保留现场并停止。")
                         if state['recognized'] and state['count'] > 1:
                             raise RuntimeError("视频号页面存在重复素材，尚未完成上传；已保留现场并停止。")
                         if state['recognized'] and state['all_uploaded'] and not transfer_complete:
@@ -929,7 +962,8 @@ class TencentBaseUploader(BaseVideoUploader):
                             progress_operation("upload", "processing")
                             transfer_complete = True
                         if (state['recognized'] and state['count'] == state['video_count'] == state['done_count'] == 1
-                                and state['all_uploaded'] and state['all_cover_cropped']):
+                                and state['all_uploaded']
+                                and (binding is None or bound_state=='done')):
                             if not transfer_complete:
                                 progress_operation("upload", "transfer", "completed")
                                 progress_operation("upload", "processing")
@@ -1001,8 +1035,7 @@ class TencentBaseUploader(BaseVideoUploader):
         if getattr(self, "draft_only", False):
             from uploader.draft_only import assert_draft_safe, save_draft
             await assert_draft_safe(page, "视频号")
-            await save_draft(page, "视频号", self.title, getattr(self, "draft_receipt", None), expected=getattr(self, "draft_expected", None))
-            return
+            return await save_draft(page, "视频号", self.title, getattr(self, "draft_receipt", None), expected=getattr(self, "draft_expected", None))
         is_draft = getattr(self, "is_draft", False)
         # 先等待并清理遮罩/弹窗,再等发表按钮出现
         for wait_round in range(60):
@@ -1120,6 +1153,75 @@ class TencentVideo(TencentBaseUploader):
         await page.get_by_role("button", name="删除", exact=True).click()
         await self.upload_video_file(page, self.file_path)
 
+    async def _wait_for_draft_cover_entry(self, page, selectors):
+        """Wait for the platform's visible edit control, independently of upload.
+
+        Official 841.d575b04c.js:1924524 renders .edit-btn when the card
+        exists, .loading-wrap while generating, and a ratio mask when its
+        native handler would reject editing. Reading this DOM invokes neither
+        disablePostTip/mediaList nor any Vue or SDK business method.
+        """
+        from uploader.draft_only import assert_draft_safe
+        from uploader.tc_pipeline import read_tc_upload_binding
+        self._draft_cover_phase = "等待平台封面控件准备"
+        emit_progress("cover", "running", detail="等待平台封面控件准备")
+        tencent_logger.info(_msg("🖼️", "视频已上传完成，等待平台封面控件准备"))
+        started = time.monotonic()
+        configured = getattr(self, 'draft_cover_ready_timeout', None)
+        deadline = started + min(900, configured if configured is not None else 120)
+        processing_deadline = started + min(900, getattr(self, 'draft_cover_processing_timeout', 900))
+        sampled, extended = -1, False
+        ready = r'''e => {
+ const card='.horizon-cover-wrap,.horizontal-cover-wrap,.vertical-cover-wrap';
+ if(!e.matches(card))return false;
+ const visible=node=>{const style=node.ownerDocument.defaultView.getComputedStyle(node),box=node.getBoundingClientRect();
+  return node.isConnected&&box.width>0&&box.height>0&&style.display!=='none'&&style.visibility!=='hidden'&&style.visibility!=='collapse'&&Number(style.opacity)!==0;};
+ if(!visible(e)||e.ownerDocument.defaultView.getComputedStyle(e).pointerEvents==='none'||
+    e.getAttribute('aria-disabled')==='true'||e.hasAttribute('disabled'))return false;
+ if([...e.querySelectorAll('.loading-wrap,.primary-loading,.vertical-mask-layer,.horizon-mask-layer')].some(visible))return false;
+ const edits=[...e.querySelectorAll('.edit-btn')].filter(n=>visible(n)&&n.textContent.trim()==='编辑');
+ return edits.length===1;
+}'''
+        while time.monotonic() < deadline:
+            await assert_draft_safe(page, "视频号")
+            binding = getattr(page, '_sau_tc_native_import', None)
+            if binding is not None:
+                state = await read_tc_upload_binding(binding)
+                if state == 'failed':
+                    raise RuntimeError("视频号本次上传已失败，未进入封面编辑。")
+                if state == 'changed':
+                    raise RuntimeError("视频号当前素材与本次导入的视频不一致，未进入封面编辑。")
+                if state != 'done':
+                    await asyncio.sleep(.1)
+                    continue
+            session = getattr(page, '_sau_draft_evidence', None)
+            observer = getattr(session, 'tc_processing_observer', None)
+            if configured is None and observer is not None and time.monotonic() - sampled >= 1:
+                sampled = time.monotonic()
+                await observer.drain()
+                native = observer.native
+                if native and native.get('mode') == 'async_clip':
+                    ticket = (native['ticket']['clipKey'], native['ticket']['draftId'])
+                    pending = [x for x in observer.records if x.get('operation') == 'result' and x.get('ticket') == ticket]
+                    if pending and pending[-1].get('failed'):
+                        raise RuntimeError("视频号本次媒体处理已失败，未进入封面编辑。")
+                    if (pending and pending[-1].get('pending') is True and not pending[-1].get('failed') and
+                            observer._augment_with_native(session.upload_links(), native)[1]):
+                        deadline = max(deadline, processing_deadline)
+                        if not extended:
+                            extended = True
+                            emit_progress('cover', 'running', detail='视频已上传，平台仍在处理本次封面；等待原生编辑入口，最多15分钟')
+            for frame in page.frames:
+                for selector in selectors:
+                    for entry in await frame.locator(selector).all():
+                        if (await entry.is_visible() and await entry.is_enabled() and
+                                await entry.evaluate(ready, isolated_context=False)):
+                            self._draft_cover_phase = "打开封面编辑器"
+                            emit_progress("cover", "running")
+                            return frame, entry
+            await asyncio.sleep(.1)
+        raise RuntimeError("视频号视频已上传完成，但平台封面控件仍在生成或不可编辑，已保留页面并停止。")
+
     async def open_thumbnail_dialog(self, page: Page, selectors: list[str], dialog_titles: list[str]):
         if getattr(self, "draft_only", False):
             from uploader.draft_only import assert_draft_safe
@@ -1145,49 +1247,44 @@ class TencentVideo(TencentBaseUploader):
                 return existing[0]
             if len(existing) > 1:
                 raise RuntimeError("视频号存在多个封面编辑器，已保留现场。")
-            for frame in page.frames:
-                for selector in selectors:
-                    for entry in await frame.locator(selector).all():
-                        if not await entry.is_visible():
-                            continue
-                        await entry.click(timeout=10000)
-                        deadline = time.monotonic() + 10
-                        direct_clicked = False
-                        while time.monotonic() < deadline:
-                            for title in dialog_titles:
-                                dialog = self._draft_cover_dialogs(frame, title)
-                                count = await dialog.count()
-                                if count == 1:
-                                    return dialog.first
-                                if count > 1:
-                                    raise RuntimeError("视频号存在多个封面编辑器，已保留现场。")
-                            # Editing the second card can first open the
-                            # official recommendation popover. Choose its
-                            # direct editor, rather than reusing the other cover.
-                            image_class = ('recommend-img-horizontal' if '编辑个人主页卡片' in dialog_titles
-                                           else 'recommend-img-vertical' if '编辑分享卡片' in dialog_titles else None)
-                            if image_class and not direct_clicked:
-                                popup = frame.locator('.cover-preview-wrap .img-recommend-wrap:visible:has(> img.' + image_class + ')')
-                                other_class = 'recommend-img-vertical' if image_class == 'recommend-img-horizontal' else 'recommend-img-horizontal'
-                                other = frame.locator('.cover-preview-wrap .img-recommend-wrap:visible:has(> img.' + other_class + ')')
-                                count = await popup.count()
-                                if count > 1 or count and await other.count():
-                                    raise RuntimeError("视频号封面推荐窗口不唯一，已保留现场。")
-                                if count == 1:
-                                    from uploader.tc_editor import read_tc_material_state
-                                    material = await read_tc_material_state(page)
-                                    if not (material['recognized'] and material['count'] == material['video_count'] == material['done_count'] == 1
-                                            and material['all_uploaded'] and material['all_cover_cropped']):
-                                        raise RuntimeError("视频号当前素材尚未完成处理，未进入封面编辑。")
-                                    direct = popup.get_by_role('button', name='直接编辑', exact=True)
-                                    if await direct.count() != 1 or not await direct.is_enabled():
-                                        raise RuntimeError("视频号独立封面编辑按钮尚未确认，已保留现场。")
-                                    await direct.click(timeout=10000)
-                                    direct_clicked = True
-                            await assert_draft_safe(page, "视频号")
-                            await asyncio.sleep(.1)
-                        raise RuntimeError("视频号封面入口已点击但编辑弹窗未出现，草稿任务已停止。")
-            return None
+            frame, entry = await self._wait_for_draft_cover_entry(page, selectors)
+            await entry.click(timeout=10000)
+            deadline = time.monotonic() + 10
+            direct_clicked = False
+            while time.monotonic() < deadline:
+                for title in dialog_titles:
+                    dialog = self._draft_cover_dialogs(frame, title)
+                    count = await dialog.count()
+                    if count == 1:
+                        return dialog.first
+                    if count > 1:
+                        raise RuntimeError("视频号存在多个封面编辑器，已保留现场。")
+                # Editing the second card can first open the
+                # official recommendation popover. Choose its
+                # direct editor, rather than reusing the other cover.
+                image_class = ('recommend-img-horizontal' if '编辑个人主页卡片' in dialog_titles
+                               else 'recommend-img-vertical' if '编辑分享卡片' in dialog_titles else None)
+                if image_class and not direct_clicked:
+                    popup = frame.locator('.cover-preview-wrap .img-recommend-wrap:visible:has(> img.' + image_class + ')')
+                    other_class = 'recommend-img-vertical' if image_class == 'recommend-img-horizontal' else 'recommend-img-horizontal'
+                    other = frame.locator('.cover-preview-wrap .img-recommend-wrap:visible:has(> img.' + other_class + ')')
+                    count = await popup.count()
+                    if count > 1 or count and await other.count():
+                        raise RuntimeError("视频号封面推荐窗口不唯一，已保留现场。")
+                    if count == 1:
+                        from uploader.tc_editor import read_tc_material_state
+                        material = await read_tc_material_state(page)
+                        if not (material['recognized'] and material['count'] == material['video_count'] == material['done_count'] == 1
+                                and material['all_uploaded']):
+                            raise RuntimeError("视频号当前素材尚未完成处理，未进入封面编辑。")
+                        direct = popup.get_by_role('button', name='直接编辑', exact=True)
+                        if await direct.count() != 1 or not await direct.is_enabled():
+                            raise RuntimeError("视频号独立封面编辑按钮尚未确认，已保留现场。")
+                        await direct.click(timeout=10000)
+                        direct_clicked = True
+                await assert_draft_safe(page, "视频号")
+                await asyncio.sleep(.1)
+            raise RuntimeError("视频号封面入口已点击但编辑弹窗未出现，草稿任务已停止。")
         for selector in selectors:
             cover_entry = page.locator(selector).first
             try:
@@ -1401,7 +1498,9 @@ class TencentVideo(TencentBaseUploader):
     async def prepare_video_for_publish(self, page: Page) -> None:
         if getattr(self, "draft_only", False):
             from uploader.draft_only import assert_draft_safe, wait_draft_upload
+            from uploader.tc_pipeline import require_tc_upload_context
             await assert_draft_safe(page, "视频号")
+            await require_tc_upload_context(page)
             with progress_part("content", "description"):
                 await wait_draft_upload(page, "视频号", ['div.input-editor:visible'], timeout=30)
                 editors = []
@@ -1423,6 +1522,7 @@ class TencentVideo(TencentBaseUploader):
                 if not isinstance(caption, str):
                     raise ValueError("视频号 caption 必须是完整文本。")
                 await editors[0].fill(caption, timeout=15000)
+                await require_tc_upload_context(page)
             with progress_part("content", "readback"):
                 if (await editors[0].inner_text()).replace("\r\n", "\n").rstrip("\n") != caption.replace("\r\n", "\n").rstrip("\n"):
                     raise RuntimeError("视频号完整描述回读不一致，草稿任务已停止。")
@@ -1447,6 +1547,9 @@ class TencentVideo(TencentBaseUploader):
             browser = await playwright.chromium.launch(**_build_launch_kwargs(headless=self.headless))
             context = await browser.new_context(storage_state=self.account_file)
 
+        stage_terminal=False
+        stage_cancelled=False
+        stage_unwatch=None
         try:
             page = embedded.page if embedded else await context.new_page()
             if getattr(self, "draft_only", False):
@@ -1459,15 +1562,31 @@ class TencentVideo(TencentBaseUploader):
 
             if not resume_video:
                 await self.upload_video_file(page, self.file_path)
+            if getattr(self,'draft_only',False):
+                from uploader.tc_stage import restore_tc_native_stage,watch_tc_native_stage
+                if resume_video:
+                    session=getattr(page,'_sau_draft_evidence',None)
+                    scope={key:session.expected.get(key) for key in ('job_id','receipt_nonce')}
+                    page._sau_tc_native_stage=await restore_tc_native_stage(page,self.file_path,session.assets.get('video'),scope)
+                stage=getattr(page,'_sau_tc_native_stage',None)
+                if stage is not None:
+                    stage_unwatch=watch_tc_native_stage(page,stage)
             if getattr(self, "draft_only", False):
-                if not resume_video:
-                    await self.wait_for_upload_complete(page)
-                await checkpoint_after_upload(page)
                 content_operations = ["description", "readback", "title"]
-                with progress_step("content", auto_complete=False,
-                                   operations=content_operations) as content_scope:
-                    await self.prepare_video_for_publish(page)
-                    content_scope.pause()
+                async def prepare_content():
+                    with progress_step("content", operations=content_operations):
+                        await self.prepare_video_for_publish(page)
+                        with progress_part("content", "title"):
+                            await self.set_short_title(page,self.title,self.short_title)
+                if not resume_video:
+                    from uploader.upload_pipeline import run_upload_pipeline
+                    await run_upload_pipeline(page,"视频号",lambda:self.wait_for_upload_complete(page),prepare_content)
+                else:
+                    await prepare_content()
+                await checkpoint_after_upload(page)
+                # Video-channel processing regenerates the default cover and
+                # can remount its ratio controls. Caption/title already ran in
+                # parallel; custom covers wait only for those real controls.
                 if self.thumbnail_landscape_path or self.thumbnail_portrait_path:
                     cover_operations = []
                     if self.thumbnail_landscape_path:
@@ -1478,11 +1597,31 @@ class TencentVideo(TencentBaseUploader):
                         await self.set_thumbnail(page)
                 else:
                     emit_progress("cover", "skipped")
-                with progress_step("content", operations=content_operations):
-                    with progress_part("content", "title"):
-                        await self.set_short_title(page, self.title, self.short_title)
+                expected=getattr(self,"draft_expected",None)
+                if expected:
+                    from uploader.draft_only import _ui_fields
+                    if not await _ui_fields(page,'tencent',expected):
+                        # Only restore text that the same processing task reset;
+                        # a changed native File is rejected before any edit.
+                        binding=getattr(page,'_sau_tc_native_import',None)
+                        if binding is not None:
+                            from uploader.tc_pipeline import read_tc_upload_binding
+                            if await read_tc_upload_binding(binding)!='done':
+                                raise RuntimeError("视频号上传完成后素材已改变，未重新填写或提交。")
+                        await prepare_content()
+                    if not await _ui_fields(page,'tencent',expected):
+                        raise RuntimeError("视频号上传完成后的内容核验不一致，未提交。")
+                binding=getattr(page,'_sau_tc_native_import',None)
+                if binding is not None:
+                    from uploader.tc_pipeline import read_tc_upload_binding
+                    if await read_tc_upload_binding(binding)!='done':
+                        raise RuntimeError("视频号最终素材与本次上传不一致，未提交。")
+                stage=getattr(page,'_sau_tc_native_stage',None)
+                if stage is not None:
+                    await asyncio.to_thread(stage.verify)
                 await assert_draft_safe(page, "视频号")
-                await self.submit_publish(page)
+                final_result=await self.submit_publish(page)
+                stage_terminal=isinstance(final_result,dict) and final_result.get('status') in ('platform_draft_verified','published_submission_verified')
                 if not embedded:
                     await context.storage_state(path=self.account_file, indexed_db=True)
                 return
@@ -1501,7 +1640,27 @@ class TencentVideo(TencentBaseUploader):
 
             if not embedded: await context.storage_state(path=self.account_file,indexed_db=getattr(self,"draft_only",False))
             tencent_logger.success(_msg("🥳", "cookie 更新完毕"))
+        except asyncio.CancelledError:
+            stage_cancelled=True
+            raise
         finally:
+            if getattr(self,"draft_only",False):
+                from uploader.tc_pipeline import release_tc_upload
+                binding=getattr(locals().get('page',None),'_sau_tc_native_import',None)
+                from uploader.tc_stage import tc_stage_prepared_page
+                keep_stage=bool(embedded and not stage_terminal and not stage_cancelled and
+                                tc_stage_prepared_page(locals().get('page',None)))
+                await release_tc_upload(binding,preserve_stage=keep_stage)
+                if binding is not None:
+                    page._sau_tc_native_import=None
+                from uploader.tc_stage import release_tc_native_stage
+                stage=getattr(locals().get('page',None),'_sau_tc_native_stage',None)
+                if not keep_stage:
+                    await release_tc_native_stage(stage)
+                if stage is not None and not keep_stage:
+                    page._sau_tc_native_stage=None
+                if stage_unwatch is not None and not keep_stage:
+                    stage_unwatch()
             if not embedded:
                 await context.close()
                 await browser.close()

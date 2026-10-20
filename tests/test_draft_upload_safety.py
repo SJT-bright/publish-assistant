@@ -5,8 +5,10 @@ prove that a real platform accepted or persisted a draft.
 Run: .venv/bin/python -m unittest tests.test_draft_upload_safety
 """
 import asyncio
+import hashlib
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -88,43 +90,61 @@ class DraftUploadSafetyTests(unittest.TestCase):
         uploader.draft_only = True
         uploader.draft_upload_timeout = .1 if outcome == "pending" else 60
         caption = "\n".join([BODY, " ".join("#" + tag for tag in TAGS)]) if platform == "douyin" else CAPTION
-        uploader.draft_expected = {"platform_fields": {"caption": caption}, "account": {"uid": "fixture-account"}, "video_sha256": "fixture-fingerprint"}
+        uploader.draft_expected = {"platform_fields": {"caption": caption}, "account": {"uid": "fixture-account"},
+                                  "video_sha256": hashlib.sha256(Path(video).read_bytes()).hexdigest()}
+        session = SimpleNamespace(page=page,platform=platform,closed=False,expected=uploader.draft_expected,
+                                  account=uploader.draft_expected['account'],fixture_complete=False)
+        page._sau_draft_evidence=session
+        async def selected_count():
+            return sum([await frame.locator('input[type="file"][accept*="video"]').evaluate_all(
+                'inputs=>inputs.reduce((count,input)=>count+input.files.length,0)') for frame in page.frames])
+        async def observe_fixture_completion(*args,**kwargs):
+            # This DOM-only fixture explicitly models the observer contract.
+            # Actual SDK/hash/task correlation remains exercised by the native
+            # per-platform suites. The form alone does not release this proof.
+            session.fixture_complete=outcome=='success' and await selected_count()==1
+        def upload_links():
+            return [{'kind':'video','complete':True,'sha256':session.expected['video_sha256'],
+                     'ids':['fixture-current-native-video']}] if session.fixture_complete else []
         if platform in ('tencent', 'xiaohongshu'):
             # These browser fixtures prove adapter control flow/full text, not
             # SDK/CDN evidence. Explicitly supply the existing evidence session
             # contract. Never weaken a production gate for fixture URLs.
-            session = SimpleNamespace(page=page, platform=platform, closed=False)
-            page._sau_draft_evidence = session
             if platform == 'tencent':
                 # The actual fail-closed CDN capture/origin/owner gate is tested
                 # independently in tests.test_tc_cdn.CaptureBrowserFixture.
                 session.capture_tc_cdn_snapshot = AsyncMock(return_value=True)
-                if outcome == 'success':
+                if outcome in ('success','failure','risk','pending'):
                     # This fixture has no official Vue composer. Explicitly
                     # model its native input state; test_tc_editor separately
                     # exercises the real read-only helper and strict gate.
                     async def material_state(actual_page):
-                        selected=sum([await frame.locator('input[type="file"][accept*="video"]').evaluate_all(
-                            'inputs=>inputs.reduce((count,input)=>count+input.files.length,0)')
-                            for frame in actual_page.frames])
-                        return dict(recognized=True,count=selected,video_count=selected,done_count=selected,
-                                    all_uploaded=selected>0,all_cover_cropped=selected>0,can_save_draft=selected>0)
+                        selected=await selected_count()
+                        done=selected if outcome=='success' else 0
+                        return dict(recognized=True,count=selected,video_count=selected,done_count=done,
+                                    all_uploaded=done>0,all_cover_cropped=done>0,can_save_draft=done>0)
                     session.read_tc_material_state=AsyncMock(side_effect=material_state)
             else:
                 # Current SDK capture and unavailable/foreign/stale task gates
                 # are covered independently in test_xhs_evidence/test_xhs_editor.
                 session.xhs_observer = SimpleNamespace(session=session, page=page,
-                    closed=False, ensure_ready=AsyncMock(return_value=True))
+                    closed=False, ensure_ready=AsyncMock(return_value=True),drain=observe_fixture_completion,
+                    upload_links=upload_links)
         elif platform == 'douyin':
             # The committed React uploader/SDK observer is tested independently
             # in test_dy_evidence; this DOM-only fixture supplies its ready contract.
-            page._sau_draft_evidence = SimpleNamespace(page=page, platform=platform, closed=False,
-                dy_observer=SimpleNamespace(ensure_ready=AsyncMock(return_value=True)))
+            async def dy_state(_expression):
+                await observe_fixture_completion()
+                return dict(scoped=True,ready=session.fixture_complete,invalid=False,percent=99 if session.fixture_complete else 0,
+                            vid='fixture-current-native-video' if session.fixture_complete else None)
+            session.dy_observer=SimpleNamespace(session=session,page=page,closed=False,scope={},latest_invocation='fixture-import',
+                video_sha256=session.expected['video_sha256'],transport=SimpleNamespace(evaluate=dy_state),
+                upload_links=upload_links,ensure_ready=AsyncMock(return_value=True))
         elif platform == 'kuaishou':
             # Native SDK evidence is tested independently in test_ks_evidence;
             # keep this fixture focused on adapter routing and form preservation.
-            page._sau_draft_evidence = SimpleNamespace(page=page, platform=platform, closed=False,
-                ks_observer=SimpleNamespace(ensure_ready=AsyncMock(return_value=True)))
+            session.ks_observer=SimpleNamespace(session=session,page=page,closed=False,drain=observe_fixture_completion,
+                upload_links=upload_links,ensure_ready=AsyncMock(return_value=True))
         return context, page, uploader
 
     async def invoke(self, platform, page, uploader):
@@ -143,7 +163,10 @@ class DraftUploadSafetyTests(unittest.TestCase):
                 await uploader.set_short_title(page, TITLE, "这是完整短标题")
                 await uploader.submit_publish(page)
             if reader is not None:
-                with patch('uploader.tc_editor.read_tc_material_state',reader):
+                # This generic form deliberately has no official Vue material
+                # owner. Native File binding itself is tested in tc_pipeline.
+                with patch('uploader.tc_editor.read_tc_material_state',reader), \
+                     patch('uploader.tc_pipeline.capture_tc_upload',new=AsyncMock(return_value=None)):
                     await tc_content()
             else:
                 await tc_content()
@@ -249,7 +272,15 @@ class DraftUploadSafetyTests(unittest.TestCase):
                     context, page, uploader = await self.setup_adapter(browser, video, platform, "pending")
                     save = AsyncMock()
                     waits = []
-                    wait_upload = draft_only.wait_draft_upload
+                    if platform=='douyin':
+                        from uploader.dy_upload_ready import wait_dy_video_uploaded as wait_upload
+                        target='uploader.dy_upload_ready.wait_dy_video_uploaded'
+                    elif platform in ('xiaohongshu','kuaishou'):
+                        from uploader.xhs_ks_upload_ready import wait_xhs_ks_upload_complete as wait_upload
+                        target='uploader.xhs_ks_upload_ready.wait_xhs_ks_upload_complete'
+                    else:
+                        wait_upload=uploader.wait_for_upload_complete
+                        target=None
                     async def measured_wait(*args, **kwargs):
                         started = asyncio.get_running_loop().time()
                         try:
@@ -257,10 +288,11 @@ class DraftUploadSafetyTests(unittest.TestCase):
                         finally:
                             waits.append(asyncio.get_running_loop().time() - started)
                     try:
-                        with patch.object(draft_only, "save_draft", save), patch.object(draft_only, "wait_draft_upload", measured_wait):
+                        wait_patch=patch(target,new=measured_wait) if target else patch.object(uploader,'wait_for_upload_complete',new=measured_wait)
+                        with patch.object(draft_only, "save_draft", save), wait_patch:
                             with self.assertRaises((RuntimeError, TimeoutError)) as failure:
                                 await asyncio.wait_for(self.invoke(platform, page, uploader), timeout=30)
-                            self.assertTrue("超时" in str(failure.exception) or "timeout" in str(failure.exception).lower())
+                            self.assertTrue(any(text in str(failure.exception) for text in ('超时','完成回执','尚未完成')) or "timeout" in str(failure.exception).lower())
                             self.assertEqual(len(waits), 1)
                             self.assertLess(waits[0], 2)
                         self.assertEqual(await self.video_submissions(page), 1)
@@ -284,19 +316,34 @@ class DraftUploadSafetyTests(unittest.TestCase):
             context = await browser.new_context()
             page = await context.new_page()
             await page.set_content('''<script>window.coverUploads=[];window.coverTab='';</script>
-              <button onclick="document.querySelector('.dy-creator-content-modal').style.display='block'">编辑封面</button>
+              <h2>基础信息</h2>
+              <div class="coverControl-portrait"><div><span>竖封面3:4</span></div>
+                <button onclick="document.querySelector('.dy-creator-content-modal').style.display='block'">编辑封面</button></div>
+              <div class="coverControl-landscape"><div><span>横封面4:3</span></div>
+                <button onclick="document.querySelector('.dy-creator-content-modal').style.display='block'">编辑封面</button></div>
               <div class="dy-creator-content-modal" style="display:none">
                 <button onclick="window.coverTab='portrait'">设置竖封面</button>
                 <button onclick="window.coverTab='landscape'">设置横封面</button>
                 <div class="semi-upload"><span class="semi-upload-drag-area-main-text">上传封面</span>
                   <input type="file" class="semi-upload-hidden-input" accept="image/png"
                     onchange="if(this.files.length){window.coverUploads.push([window.coverTab,this.files[0].name]);document.body.dataset.coverUploads=JSON.stringify(window.coverUploads)}"></div>
-                <button onclick="document.querySelector('.dy-creator-content-modal').style.display='none'">完成</button>
+                <button onclick="document.querySelector('.semi-upload-hidden-input').value='';document.querySelector('.dy-creator-content-modal').style.display='none'">完成</button>
               </div>''')
             cover = Path(video).with_suffix(".png")
             cover.write_bytes(b"synthetic image input fixture")
             uploader = DouYinVideo(TITLE, video, [], 0, "unused.json", thumbnail_landscape_path=str(cover), thumbnail_portrait_path=str(cover))
             uploader.draft_only = True
+            observed=[]
+            async def source_ready(role,selector):
+                native=page.locator(selector)
+                valid=await native.evaluate('(e)=>e.files.length===1&&e.files[0].name',isolated_context=False)==cover.name
+                if valid:observed.append(role)
+                return valid
+            # The native cover/crop proof has independent browser suites. This
+            # form fixture keeps actual orientation clicks and file readback.
+            observer=SimpleNamespace(available=True,ensure_ready=source_ready,drain=AsyncMock(),
+                                     upload_links=lambda:[{'slot':role} for role in observed])
+            page._sau_draft_evidence=SimpleNamespace(page=page,closed=False,dy_cover_observer=observer)
             try:
                 await uploader.set_thumbnail(page)
                 self.assertEqual(await page.evaluate("JSON.parse(document.body.dataset.coverUploads || '[]')"), [["portrait", cover.name], ["landscape", cover.name]])
@@ -315,7 +362,11 @@ class DraftUploadSafetyTests(unittest.TestCase):
                         uploader.validate_upload_args = AsyncMock()
                         save = AsyncMock()
                         try:
-                            with patch.object(draft_only, "save_draft", save):
+                            with ExitStack() as stack:
+                                stack.enter_context(patch.object(draft_only,"save_draft",save))
+                                if platform=='tencent':
+                                    stack.enter_context(patch('uploader.tc_editor.read_tc_material_state',page._sau_draft_evidence.read_tc_material_state))
+                                    stack.enter_context(patch('uploader.tc_pipeline.capture_tc_upload',new=AsyncMock(return_value=None)))
                                 if outcome == "failure":
                                     with self.assertRaises(RuntimeError):
                                         await uploader.upload(None)

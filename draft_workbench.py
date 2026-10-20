@@ -1,4 +1,4 @@
-"""Local, single-user draft workbench. No public publishing endpoint."""
+"""Local, single-user draft workbench. Explicitly selected draft or publication workflow."""
 import argparse
 import copy
 import hashlib
@@ -22,7 +22,8 @@ from urllib.parse import urlparse, parse_qs
 from draft_runner import PLATFORMS, ROOT, account_file
 from uploader.embedded_browser import embedded_account_file, bridge_request
 from workbench_model import (PLATFORM_POLICIES, VERIFIED_STATUSES, UNRESOLVED_STATUSES,
-                             preflight_payload, build_platform_payload, validate_receipt, hash_asset, canonical_sha)
+                             preflight_payload, build_platform_payload, validate_receipt, validate_publication_receipt,
+                             PUBLICATION_VERIFIED_STATUSES, PUBLICATION_STATUSES, hash_asset, canonical_sha)
 from platform_limits import check_text
 from workbench_progress import (PREFIX as PROGRESS_PREFIX, parse_progress, apply_progress,
                                 finish_progress, progress_summary, public_progress, valid_job_id)
@@ -140,6 +141,12 @@ def account_context(platform, browser):
     recent = ACCOUNTS.get(browser + ':' + platform, {})
     account = saved.get('account') or recent.get('account') or {}
     identity = account.get('identity') if isinstance(account, dict) else None
+    if browser == 'embedded':
+        live = current_sessions().get(platform, {})
+        if live.get('status') == 'login_verified' and live.get('identity'):
+            # A new task binds to this app's fresh, authenticated page. Disk
+            # markers describe an earlier session and never override that page.
+            identity = live['identity']
     return {'account_key': browser + ':' + platform + ':' + (identity or 'default'),
             'identity': identity, 'verified_at': saved.get('verified_at') or recent.get('verified_at'),
             'session_record_present': bool(saved.get('present'))}
@@ -177,6 +184,26 @@ def save_editor(data):
         return EDITOR
 
 
+def clear_editor(data):
+    """Reset only the homepage material draft, retaining sessions and receipts."""
+    global EDITOR
+    ensure_store()
+    platforms = data.get('platforms', EDITOR.get('platforms', []))
+    if not isinstance(platforms, list) or any(p not in PLATFORMS for p in platforms):
+        raise ValueError('所选平台格式无效。')
+    with LOCK:
+        if CURRENT and CURRENT.get('active'):
+            raise ValueError('当前任务正在处理，请等待完成或停止后再清空草稿。')
+        previous = EDITOR
+        EDITOR = {'payload': {}, 'platforms': list(dict.fromkeys(platforms)), 'updated_at': time.time()}
+        try:
+            persist()
+        except Exception:
+            EDITOR = previous
+            raise
+        return EDITOR
+
+
 def record_operation(job, item):
     expected = item.get('expected')
     if not expected: return
@@ -192,7 +219,7 @@ def record_operation(job, item):
         attempts.append({k: v for k, v in old.items() if k != 'attempts'})
     LEDGER[expected['operation_key']] = {**{k: expected[k] for k in ('operation_key', 'platform_id', 'account_key', 'video_sha256', 'content_sha256', 'cover_sha256')},
         'actual_account_identity': account.get('identity') or item.get('account_identity') or old.get('actual_account_identity'),
-        'browser': job['browser'], 'job_id': job['id'], 'execution_attempt': item.get('resume_count', 0),
+        'workflow_action': job.get('action', 'draft'), 'browser': job['browser'], 'job_id': job['id'], 'execution_attempt': item.get('resume_count', 0),
         'status': item['status'], 'message': item.get('message'),
         'draft_id': evidence.get('draft_id'), 'save_location': evidence.get('save_location'), 'updated_at': time.time()}
     if attempts: LEDGER[expected['operation_key']]['attempts'] = attempts
@@ -205,14 +232,15 @@ def duplicate_record(fingerprint, identity, browser):
                         or bool(identity and record.get('actual_account_identity') == identity)
                         or not record.get('actual_account_identity') and str(record.get('account_key', '')).endswith(':default'))
         if record.get('platform_id') != fingerprint['platform_id'] or record.get('browser') != browser or not same_account: continue
-        same_material = all(record.get(k) == fingerprint[k] for k in ('video_sha256', 'content_sha256', 'cover_sha256'))
+        same_workflow = record.get('workflow_action', 'draft') == fingerprint.get('workflow_action', 'draft')
+        same_material = same_workflow and all(record.get(k) == fingerprint[k] for k in ('video_sha256', 'content_sha256', 'cover_sha256'))
         status = record.get('status')
         # Older adapters classified an ambiguous control as an account restriction.
         # Keep that operation unresolved without blocking different materials on
         # the account. Actual platform restrictions and risk pauses still hold.
         old_control_mismatch = status == 'platform_restricted' and '多个可能的素材或内容控件' in str(record.get('message', ''))
         account_hold = status == 'risk_paused' or status == 'platform_restricted' and not old_control_mismatch
-        if account_hold or same_material and status in VERIFIED_STATUSES | UNRESOLVED_STATUSES:
+        if account_hold or same_material and status in VERIFIED_STATUSES | UNRESOLVED_STATUSES | PUBLICATION_VERIFIED_STATUSES | {'published_unverified', 'publication_blocked'}:
             return record
     return None
 
@@ -297,6 +325,9 @@ def recorded_source(record):
 def duplicate_details(record, expected):
     """Project real old errors and steps without marking a new execution done."""
     prefixes = {
+        'published_unverified': '前次已尝试投稿，回执待确认；未重复提交。',
+        'published_submission_verified': '已有本素材的投稿回执，未重复提交。',
+        'publication_blocked': '此前投稿停在提交前核验；未重复执行。',
         'saved_unverified': '前次已尝试保存，但尚未核验；请先打开平台检查草稿。',
         'result_unknown': '前次任务未完成核验；未自动重复上传。',
         'adapter_mismatch': '前次停在页面控件识别；未自动重复上传。',
@@ -671,7 +702,7 @@ def current_sessions():
         result={}
         for key,item in value.get('platforms',{}).items():
             if key not in PLATFORMS or not isinstance(item,dict):continue
-            result[key]={k:item[k] for k in ('status','checked_at','capabilities') if k in item}
+            result[key]={k:item[k] for k in ('status','identity','checked_at','capabilities') if k in item}
         return result
     except (OSError,ValueError,TypeError):
         return {}
@@ -761,6 +792,9 @@ def worker_progress(job, item, line):
 
 
 STATUS_MESSAGES = {
+    'published_submission_verified': '投稿已提交，等待平台审核',
+    'published_unverified': '已尝试投稿，回执待确认；不会自动再次提交',
+    'publication_blocked': '提交前核验未通过，页面已保留',
     'local_draft_verified': '本地草稿已重开核验，保存在当前浏览器',
     'platform_draft_verified': '平台草稿已重开核验',
     'platform_snapshot_verified': '平台暂存快照已重开核验；新快照可能覆盖此份',
@@ -798,7 +832,7 @@ def worker(job, payload):
                 transition(job, item, 'cancelled', '已停止，此平台尚未执行'); continue
             with LOCK:
                 item['started_at'] = time.time()
-                transition(job, item, 'running', ('请在 App 内的平台页面扫码登录' if job['browser'] == 'embedded' else '请在浏览器扫码登录') if job['action'] == 'login' else '现场确认账号，上传素材并重开核验草稿')
+                transition(job, item, 'running', ('请在 App 内的平台页面扫码登录' if job['browser'] == 'embedded' else '请在浏览器扫码登录') if job['action'] == 'login' else '现场确认账号，上传时填写内容，核验后提交投稿' if job['action'] == 'publish' else '现场确认账号，上传素材并重开核验草稿')
             log(f"—— {item['name']} ——")
             execution_directory = directory
             if item.get('resume_count'):
@@ -807,7 +841,7 @@ def worker(job, payload):
             receipt = execution_directory / f"{item['platform']}-receipt.json"
             receipt.unlink(missing_ok=True)
             cmd = runner_command() + [job['action'], '--platform', item['platform']]
-            if job['action'] == 'draft':
+            if job['action'] in ('draft', 'publish'):
                 expected = item['expected']
                 # Reject a changed video before starting a subprocess/browser operation.
                 if hash_asset(expected['video']) != expected['video_sha256']:
@@ -881,9 +915,10 @@ def worker(job, payload):
             elif receipt.is_file():
                 try:
                     if receipt.stat().st_mtime < item['started_at']: raise ValueError('收到旧任务回执。')
-                    evidence = validate_receipt(json.loads(receipt.read_text(encoding='utf-8')), item['expected'])
+                    validator = validate_publication_receipt if job['action'] == 'publish' else validate_receipt
+                    evidence = validator(json.loads(receipt.read_text(encoding='utf-8')), item['expected'])
                     status = evidence['status']
-                    if status in VERIFIED_STATUSES:
+                    if status in VERIFIED_STATUSES | PUBLICATION_VERIFIED_STATUSES:
                         with LOCK:
                             ACCOUNTS[job['browser'] + ':' + item['platform']] = {'account': evidence['account'], 'verified_at': time.time()}
                     message = STATUS_MESSAGES.get(status, status)
@@ -918,7 +953,7 @@ def require_automated_platform(platform):
 def start_job(data):
     global CURRENT, HISTORY
     action = data.get('action')
-    if action not in ('login', 'draft'): raise ValueError('只支持登录和保存草稿。')
+    if action not in ('login', 'draft', 'publish'): raise ValueError('只支持登录、保存草稿和提交投稿。')
     if not isinstance(data.get('platforms'), list): raise ValueError('请选择有效的平台。')
     platforms = list(dict.fromkeys(data.get('platforms', [])))
     if not platforms or any(x not in PLATFORMS for x in platforms): raise ValueError('请选择有效的平台。')
@@ -929,22 +964,26 @@ def start_job(data):
     payload = dict(data.get('payload') or {})
     browser = data.get('browser', 'external')
     if browser not in ('external', 'embedded'): raise ValueError('浏览器类型无效。')
-    if action == 'draft':
-        check = preflight(data)
+    if action in ('draft', 'publish'):
+        payload['workflow_action'] = action
+        check = preflight({**data, 'payload': payload})
         if check['errors']:
             raise ValueError('素材预检未通过：' + '；'.join((PLATFORMS.get(e['platform'], '') + ' ' + e['message']).strip() for e in check['errors']))
         payload = check['payload']
     with LOCK:
         if CURRENT and CURRENT['active']: raise ValueError('当前任务尚未结束，请等待或停止任务。')
+        contexts = {platform: account_context(platform, browser) for platform in platforms}
+        if action in ('draft', 'publish') and any(check['fingerprints'][platform]['account_key'] != contexts[platform]['account_key'] for platform in platforms):
+            raise ValueError('预检期间当前账号发生变化，请重新检查素材；尚未上传。')
         if CURRENT: HISTORY.append(CURRENT)
         CURRENT = {'id': time.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8], 'action': action, 'browser': browser, 'active': True,
                    'created_at': time.time(),
                    'cancelled': False, 'logs': [], 'results': [
                        {'platform': x, 'name': PLATFORMS[x], 'status': 'pending', 'message': '等待执行'} for x in platforms]}
-        if action == 'draft':
+        if action in ('draft', 'publish'):
             for item in CURRENT['results']:
                 platform = item['platform']
-                context = account_context(platform, browser)
+                context = contexts[platform]
                 item['account_identity'] = context['identity']
                 item['expected'] = build_platform_payload(check, platform, CURRENT['id'], secrets.token_hex(24))
                 item['expected']['expected_account_identity'] = context['identity']
@@ -1222,6 +1261,7 @@ class Handler(BaseHTTPRequestHandler):
                 ASSETS.add(result['path'])
             elif self.path == '/api/load': result = load_material(data.get('path', ''), data.get('video'))
             elif self.path == '/api/editor': result = save_editor(data)
+            elif self.path == '/api/editor/clear': result = clear_editor(data)
             elif self.path == '/api/text-check':
                 caps={p:s.get('capabilities',{}) for p,s in current_sessions().items()} if data.get('browser')=='embedded' else {}
                 result=check_text(data.get('payload',{}),data.get('platforms',[]),caps)

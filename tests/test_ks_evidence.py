@@ -157,10 +157,10 @@ class KSProtocolTests(unittest.IsolatedAsyncioTestCase):
                 for private in ('upload.kuaishouzt.com', 'private-shape-token', 'fixture-private-token', '123456789'):
                     self.assertNotIn(private, output.getvalue())
 
-    async def test_sdk_optional_empty_fallback_keeps_all_nonempty_hosts_strict(self):
+    async def test_sdk_optional_fallback_keeps_only_trusted_primary_candidates(self):
         cases=[(['upload.kuaishouzt.com','backup.kuaishouzt.com',''],True),
             ([''],False),(['upload.kuaishouzt.com',' ',''],False),
-            (['upload.kuaishouzt.com','unknown.example.com',''],False),
+            (['upload.kuaishouzt.com','unknown.example.com',''],True),
             (['upload.kuaishouzt.com',None,''],False),
             (['upload.kuaishouzt.com','https://backup.kuaishouzt.com',''],False)]
         for endpoints,allowed in cases:
@@ -297,6 +297,20 @@ class KSNativeBrowserTests(unittest.IsolatedAsyncioTestCase):
             {'result': 1, 'data': {'coverKey': 'fixture-cropped-cover'}}, now + .01)
         await self.page.main_frame.evaluate("()=>{window.fixture.form.coverKey='fixture-cropped-cover'}", isolated_context=False)
         await self.observer.drain()
+
+    async def test_live_percent_requires_this_native_file_hash_and_never_completes_upload(self):
+        await self.setup_fixture()
+        await self.page.main_frame.evaluate('()=>{fixture.progress.status=2;fixture.progress.percent=54}',isolated_context=False)
+        self.assertEqual(await self.observer.upload_progress(),54)
+        self.assertEqual(self.observer.upload_links(),[])
+        await self.page.main_frame.evaluate('()=>{fixture.progress.status=3;fixture.progress.percent=0}',isolated_context=False)
+        self.assertIsNone(await self.observer.upload_progress())
+        await self.page.main_frame.evaluate('()=>{fixture.progress.status=2;fixture.progress.percent=54}',isolated_context=False)
+        self.session.expected['video_sha256']='0'*64
+        self.assertIsNone(await self.observer.upload_progress())
+        self.session.expected['video_sha256']=self.session.assets['video']['sha256']
+        await self.page.main_frame.evaluate('()=>{fixture.progress.percent=NaN}',isolated_context=False)
+        self.assertIsNone(await self.observer.upload_progress())
 
     async def test_png_draw_same_cropper_native_jpeg_upload_and_current_consumption(self):
         video, original = await self.setup_fixture()

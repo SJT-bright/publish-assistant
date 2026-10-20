@@ -2,17 +2,23 @@ const $=id=>document.getElementById(id);
 const names={};
 const platformIcon=id=>window.DraftVisual.icon(id);
 const progressLabels={session:'验证登录',video:'导入视频',upload:'等待上传完成',content:'填写标题、文案和话题',cover:'设置封面',save:'保存草稿',verify:'重开核验'};
-const verifiedStatuses=new Set(['local_draft_verified','platform_draft_verified','platform_snapshot_verified']);
-const terminalLabels={cancelled:'已停止',failed:'执行失败',saved_unverified:'保存尚未核验',result_unknown:'结果待确认',
+const verifiedStatuses=new Set(['local_draft_verified','platform_draft_verified','platform_snapshot_verified','published_submission_verified']);
+const terminalLabels={published_unverified:'已尝试投稿，回执待确认',publication_blocked:'提交前核验未通过',cancelled:'已停止',failed:'执行失败',saved_unverified:'保存尚未核验',result_unknown:'结果待确认',
   risk_paused:'平台提示风险，已暂停',platform_restricted:'平台权限受限',adapter_mismatch:'页面控件待适配',
   needs_reauthentication:'需要重新登录',account_mismatch:'账号不一致，已停止'};
 let currentState=null;
 function formatWait(seconds){const total=Math.max(0,Math.floor(seconds));return String(Math.floor(total/60)).padStart(2,'0')+':'+String(total%60).padStart(2,'0');}
 function renderProgress(state){
   const envelope=state.taskProgress,job=envelope?.job;
-  const container=$('taskProgress');container.hidden=!job;document.body.classList.toggle('has-task-progress',!!job);
-  if(!job)return;
-  const progress=job.progress,connected=envelope.connected!==false,login=job.action==='login';
+  // A finished record from another platform must not look like this page's
+  // current upload. Active jobs still remain visible across page switches.
+  const show=!!job && (job.active===true || state.selected==='workbench' || state.selected===job.platform);
+  const container=$('taskProgress');container.hidden=!show;document.body.classList.toggle('has-task-progress',show);
+  if(!show)return;
+  const progress=job.progress,connected=envelope.connected!==false,login=job.action==='login',publishing=job.action==='publish';
+  const labels=publishing?{...progressLabels,save:'提交投稿',verify:'核验投稿回执'}:progressLabels;
+  const concurrent=(progress?.active_stages||[]).filter(id=>window.DraftProgress.stages.includes(id));
+  const activeStages=new Set(concurrent.length?concurrent:[progress?.stage]);
   const verified=login ? job.status==='login_verified' : verifiedStatuses.has(job.status);
   const stepFailed=progress?.state==='failed';
   const active=job.active===true && !verified && !stepFailed;
@@ -24,13 +30,14 @@ function renderProgress(state){
   const otherPage=state.selected!==job.platform;
   $('progressScope').textContent=!connected?'最后记录':active?'执行中':'最近任务';
   $('progressPlatform').textContent='平台 '+job.platform_index+'/'+job.platform_count+' · '+platformName;
-  const stage=progressLabels[progress?.stage] || '';
+  const stage=labels[progress?.stage] || '';
   let label;
   if(!connected)label='进度连接中断'+(stage?' · 最后停在'+stage:'');
-  else if(verified)label=login?'登录已验证':'草稿已重开核验';
+  else if(verified)label=login?'登录已验证':publishing?'投稿已提交 · 等待平台审核':'草稿已重开核验';
   else if(stepFailed)label='此步骤失败'+(stage?' · 停在'+stage:'');
   else if(!active)label=(terminalLabels[job.status] || '任务已结束，结果待确认')+(stage?' · 停在'+stage:'');
   else if(login)label='等待扫码或完成登录验证';
+  else if(concurrent.length>1)label=concurrent.map(id=>labels[id]).join(' ＋ ');
   else if(progress?.state==='completed')label='本步骤已完成 · '+stage+'；等待下一步骤';
   else if(progress?.state==='skipped')label='本步骤已跳过 · '+stage+'；等待下一步骤';
   else if(stage)label=stage;
@@ -53,17 +60,19 @@ function renderProgress(state){
     const id=node.dataset.stage;
     const done=completed.has(id),skip=!done && skipped.has(id);
     let kind=!progress?'unrecorded':done?'completed':skip?'skipped':'pending';
-    if(!done && !skip && id===progress?.stage){
+    if(!done && !skip && activeStages.has(id)){
       kind=!connected?'offline':active?'running':verified?'completed':job.status==='cancelled'?'cancelled':'unconfirmed';
       if(progress.state==='failed')kind='failed';
     }
     node.dataset.state=kind;
     const measured=metrics.rows.find(row=>row.stage===id);
     const pct=measured?.percent;
-    node.textContent=progressLabels[id]+' '+(pct===null?'—':pct+'%');
+    const unknownUpload=id==='upload' && activeStages.has(id) && !done && !skip && typeof measured?.detail?.percent!=='number';
+    node.textContent=labels[id]+(unknownUpload?' · '+(active?'检测中':'未核验'):' '+(pct===null?'—':pct+'%'));
     node.style.setProperty('--stage-percent',(pct||0)+'%');
     node.setAttribute('aria-current',kind==='running'?'step':'false');
-    node.title=progressLabels[id]+'：'+({completed:'已完成',skipped:'已跳过',pending:'未开始',running:'进行中',offline:'连接中断',cancelled:'已停止',failed:'失败',unconfirmed:'待确认',unrecorded:'无步骤记录'}[kind]);
+    node.title=labels[id]+'：'+({completed:'已完成',skipped:'已跳过',pending:'未开始',running:'进行中',offline:'连接中断',cancelled:'已停止',failed:'失败',unconfirmed:'待确认',unrecorded:'无步骤记录'}[kind]);
+    if(unknownUpload)node.title+='；平台尚未提供字节进度，正在核对本次上传与处理回执';
     if(done)completeCount++;if(skip)skipCount++;
   }
   if(progress)bar.setAttribute('aria-valuenow',String(completeCount));else bar.removeAttribute('aria-valuenow');
@@ -76,16 +85,17 @@ function renderProgress(state){
   let detail;
   if(!connected)detail='无法取得最新进度，以上为最后记录；恢复连接后更新。';
   else if(!progress && !login)detail=verified?'草稿已核验；此任务未记录各步骤进度。':(active?'':'任务已结束；')+'具体步骤尚未上报，不能据此判断上传或保存成功。'+(job.message?' · '+job.message:'');
+  else if(concurrent.length>1)detail='视频继续上传，同时处理内容；全部填写完成后再核验本次上传。';
   else if(stepWaiting && elapsed!==null && elapsed>=45)detail='此步骤仍在等待平台响应'+(job.message?' · '+job.message:'');
   else if(login)detail=job.message || (active?'登录状态会保存在本机。':'');
   else detail='已完成 '+completeCount+' 步'+(skipCount?' · 跳过 '+skipCount+' 步':'')+(job.message?' · '+job.message:'');
   if(otherPage)detail=(connected && active?'正在处理 '+platformName+'；当前浏览 '+browsingName+'。':
     '当前浏览 '+browsingName+'；以上是'+(!connected?'最后的':'最近的')+platformName+'任务记录。')+' '+detail;
-  renderPercent(metrics,{login,active,connected,progress,verified});
+  renderPercent(metrics,{login,active,connected,progress,verified,publishing});
   $('progressDetail').textContent=detail;
   $('progressDetail').title=detail;
 }
-function renderPercent(metrics,{login,active,connected,progress,verified}){
+function renderPercent(metrics,{login,active,connected,progress,verified,publishing}){
   const percent=$('progressPercent'),meter=$('progressMeter'),fill=$('progressFill'),parts=$('progressOperations');
   percent.hidden=meter.hidden=parts.hidden=login;
   const value=metrics.percent;
@@ -95,16 +105,19 @@ function renderPercent(metrics,{login,active,connected,progress,verified}){
   if(value===null)meter.removeAttribute('aria-valuenow');else meter.setAttribute('aria-valuenow',String(value));
   meter.setAttribute('aria-valuetext',value===null?'未上报步骤':value+'%，'+(!connected?'最后记录':verified?'已核验':active?'处理中':'任务已停止'));
   const row=metrics.current;
-  if(row){
-    const signature=JSON.stringify([progress.stage,row,active,connected]);
+  const operationLabels=publishing?{...metrics.operations,save:{guard:'核验提交条件',action:'提交一次投稿',response:'等待投稿响应'},verify:{response:'核对投稿回执',reopen:'打开作品记录',content:'核对提交内容',owner:'核对所属账号'}}:metrics.operations;
+  const rows=(progress?.active_stages?.length>1?progress.active_stages:[progress?.stage]).map(stage=>({stage,row:metrics.rows.find(item=>item.stage===stage)?.detail})).filter(item=>item.row);
+  if(rows.length){
+    const signature=JSON.stringify([rows,active,connected,publishing]);
     if(parts.dataset.signature!==signature){
       parts.dataset.signature=signature;parts.textContent='';
-      for(const id of row.plan){
+      for(const {stage,row} of rows)for(const id of row.plan){
         const node=document.createElement('span');
         const done=row.completed.includes(id),skipped=row.skipped.includes(id),current=row.current===id;
         const pct=done||skipped?100:current&&typeof row.percent==='number'?row.percent:0;
         node.className='progress-operation';node.dataset.state=done?'completed':skipped?'skipped':current?row.state:'pending';
-        node.textContent=metrics.operations[progress.stage][id]+' · '+(skipped?'跳过':pct+'%'+(current&&row.state==='running'&&!Object.hasOwn(row,'percent')?(active&&connected?' · 待回执':' · 未完成'):''));
+        const unknownUpload=stage==='upload' && current && !done && !skipped && !Object.hasOwn(row,'percent');
+        node.textContent=operationLabels[stage][id]+' · '+(unknownUpload?(active&&connected?'正在检测平台回执':'回执未核验'):skipped?'跳过':pct+'%'+(current&&row.state==='running'&&!Object.hasOwn(row,'percent')?(active&&connected?' · 待回执':' · 未完成'):''));
         node.title=node.textContent;
         node.style.setProperty('--stage-percent',pct+'%');
         if(current)node.setAttribute('aria-current','step');
@@ -137,6 +150,8 @@ function adjustZoom(delta){
 }
 function render(state){
   currentState=state;
+  renderSoftwareUpdate(state);
+  if($('appVersion'))$('appVersion').textContent=state.version?'v'+state.version+(state.build?' · build '+state.build:''):'';
   const connection=state.connection?.status || 'ready';
   if($('connectionPanel'))$('connectionPanel').hidden=connection==='ready';
   if($('connectionDetail'))$('connectionDetail').textContent=connection==='connecting'?'正在连接本机工作台…':'工作台连接未完成，素材和登录会话已保留。';
@@ -146,18 +161,43 @@ function render(state){
   }
   if(!$('platforms').children.length){for(const p of state.platforms){names[p.id]=p.name;const button=document.createElement('button');button.className='nav';button.dataset.platform=p.id;const icon=document.createElement('span');icon.className='badge tile';icon.dataset.brand=p.id;icon.innerHTML=platformIcon(p.id);button.append(icon,document.createTextNode(p.name));button.onclick=()=>run(()=>window.draftDesktop.select(p.id));$('platforms').append(button);}}
   for(const b of document.querySelectorAll('.nav')){const id=b.id==='workbench'?'workbench':b.dataset.platform;b.classList.toggle('active',id===state.selected);b.disabled=state.navigationLocked && id!=='workbench' && id!==state.activePlatform;}
-  const platform=state.selected!=='workbench';$('heading').textContent=names[state.selected]||'素材工作台';$('address').textContent=state.notice || (state.activeAction==='login'?'等待'+names[state.activePlatform]+'登录 · 可自由切换页面':state.active?(progressLabels[state.taskProgress?.job?.progress?.stage] || '正在准备上传')+' · 可返回素材工作台':state.loading?'正在加载…':state.url||'选择视频、封面和文案');
-  $('back').hidden=!platform;$('reload').hidden=!platform;$('back').disabled=state.navigationLocked || !state.canGoBack;$('reload').disabled=state.navigationLocked;$('closePopup').hidden=!state.popup;
-  $('repairDisplay').hidden=!platform;$('repairDisplay').disabled=!state.zoom?.available;
+  const operation=state.pageOperation,operating=operation?.status==='running';
+  const opName=operation?.kind==='repair'?'修复显示':'重新加载';
+  const opTime=operation?Math.max(0,((operation.finishedTime||Date.now())-operation.startTime)/1000):0;
+  const operationText=operation?opName+' · '+operation.detail+' · '+formatWait(opTime):'';
+  const platform=state.selected!=='workbench';$('heading').textContent=names[state.selected]||'素材工作台';$('address').textContent=operationText || state.notice || (state.activeAction==='login'?'等待'+names[state.activePlatform]+'登录 · 可自由切换页面':state.active?(progressLabels[state.taskProgress?.job?.progress?.stage] || '正在准备上传')+' · 可返回素材工作台':state.loading?'正在加载…':state.url||'选择视频、封面和文案');
+  $('back').hidden=!platform;$('reload').hidden=!platform;$('back').disabled=state.navigationLocked || !state.canGoBack;$('reload').disabled=state.navigationLocked || state.taskProgress?.job?.active===true || operating;
+  $('reload').textContent=operating&&operation.kind==='reload'?'正在重新加载…':'重新加载';
+  $('reload').classList.toggle('operation-running',operating&&operation.kind==='reload');
+  $('reload').setAttribute('aria-busy',String(operating&&operation.kind==='reload'));
+  $('reload').title=state.navigationLocked?'视频正在处理；停止任务后可重新加载':'重新请求当前页面，并显示实际加载结果';$('closePopup').hidden=!state.popup;
+  $('repairDisplay').hidden=!platform;$('repairDisplay').disabled=!state.zoom?.available || operating;
+  $('repairDisplay').textContent=operating&&operation.kind==='repair'?'正在修复显示…':'修复显示';
+  $('repairDisplay').classList.toggle('operation-running',operating&&operation.kind==='repair');
+  $('repairDisplay').setAttribute('aria-busy',String(operating&&operation.kind==='repair'));
   $('stopLogin').hidden=state.activeAction!=='login';
   const manual=state.publicationMode==='manual_publish';
   $('publicationMode').textContent=manual?'切回草稿模式':'开启网页发表';
   $('publicationMode').setAttribute('aria-pressed',String(manual));
   $('publicationMode').disabled=state.active===true || state.taskProgress?.job?.active===true;
-  $('publicationLabel').textContent=manual?(state.manualPublishAllowed?'可在平台发表':'任务中 · 仅保存草稿'):'仅保存草稿';
+  $('publicationLabel').textContent=state.activeAction==='publish'?'上传核验后直接发布':manual?(state.manualPublishAllowed?'可在平台发表':'任务中 · 仅保存草稿'):'仅保存草稿';
   renderZoom(state);
   renderProgress(state);
 }
+function renderSoftwareUpdate(state){
+  const software=state.softwareUpdate || {},button=$('softwareUpdate');
+  if(!button)return;
+  const labels={idle:'检查更新',disabled:'检查更新',checking:'正在检查更新…',current:'已是最新版本',
+    downloading:'下载更新 '+(software.percent || 0)+'%',ready:'安装 v'+software.version,error:'更新检查失败 · 重试'};
+  button.textContent=software.installing?'正在准备安装…':labels[software.status] || '检查更新';
+  button.disabled=software.installing || ['checking','downloading','disabled'].includes(software.status) ||
+    software.status==='ready' && (state.active || state.taskProgress?.job?.active===true);
+  button.title=software.message || '启动后自动检查 GitHub Releases，每 4 小时检查一次';
+  button.classList.toggle('update-ready',software.status==='ready');
+  button.setAttribute('aria-busy',String(software.installing || ['checking','downloading'].includes(software.status)));
+}
+$('githubStar').onclick=()=>run(()=>window.draftDesktop.github());
+$('softwareUpdate').onclick=()=>run(()=>currentState?.softwareUpdate?.status==='ready'?window.draftDesktop.installUpdate():window.draftDesktop.checkUpdate());
 $('publicationMode').onclick=()=>run(()=>window.draftDesktop.publicationMode(currentState?.publicationMode==='manual_publish'?'draft':'manual_publish'));
 $('workbench').onclick=()=>run(()=>window.draftDesktop.select('workbench'));
 $('reload').onclick=()=>run(()=>window.draftDesktop.reload());$('back').onclick=()=>run(()=>window.draftDesktop.back());$('closePopup').onclick=()=>run(()=>window.draftDesktop.closePopup());
@@ -167,4 +207,4 @@ if($('reconnect'))$('reconnect').onclick=()=>run(()=>window.draftDesktop.reconne
 $('fitPage').onclick=()=>run(()=>window.draftDesktop.fit());
 $('zoomOut').onclick=()=>run(()=>adjustZoom(-0.05));$('zoomIn').onclick=()=>run(()=>adjustZoom(0.05));
 window.draftDesktop.onState(render);window.draftDesktop.state().then(render);
-setInterval(()=>{if(currentState)renderProgress(currentState);},1000);
+setInterval(()=>{if(currentState){if(currentState.pageOperation?.status==='running')render(currentState);else renderProgress(currentState);}},1000);

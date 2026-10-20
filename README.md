@@ -6,7 +6,9 @@
 
 ## 下载
 
-[Mac 与 Windows 统一下载页](https://github.com/SJT-bright/publish-assistant/releases)。当前交付版本为 **1.6.1 / build 28**，安装包自带 Python 后台、浏览器驱动和视频处理工具，无需另装 Python、Chrome 或 FFmpeg。
+[Mac 与 Windows 统一下载页](https://github.com/SJT-bright/publish-assistant/releases)。当前公开发布版本为 **1.7.14 / build 45**，安装包自带 Python 后台、浏览器驱动和视频处理工具，无需另装 Python、Chrome 或 FFmpeg。
+
+从 1.7.13 起，客户端提供 GitHub Star 入口，并自动检查、下载 GitHub 最新稳定 Release 的对应系统安装包。已下载的更新由用户选择安装时间；旧客户端需先手动升级一次。安装行为、包名和维护者发布步骤见 [客户端更新说明](docs/software-updates.md)。本机候选验证与公开发布状态分开记录。
 
 - Mac：Apple Silicon，macOS 13 及以上。将 DMG 中的「发布助手」拖入应用程序。
 - Windows：Windows 10/11 x64。运行 Setup 安装，或解压 ZIP 后运行 `DraftWorkbench.exe`。

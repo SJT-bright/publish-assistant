@@ -107,7 +107,48 @@ _READ = r"""(scope=null) => {
    if(!material.$el || !call(contains,editor.$el,material.$el)||files.length!==1||
       files[0]?.isVideo!==true||files[0]?.isImage!==false||files[0]?.isValid!==true||files[0]?.status!=='done'||
       !Array.isArray(media)||media.length!==1||typeof media[0]?.url!=='string'||!media[0].url.startsWith('https://'))return null;
-   binding={editor,material,url:media[0].url};return binding;
+   let restoreVideo=null;
+   if(scope.restore){
+    const expected=scope.restore,file=files[0],ext=file.extInfo,response=file.response,m=media[0],upload=material.$refs?.postUpload;
+    if(!upload||!Array.isArray(upload.value)||upload.value.length!==1||upload.value[0]!==file||
+       !['handleCropVideo','updateVideo','updateFile','setFileList'].every(k=>typeof upload[k]==='function'))return null;
+    const size=v=>typeof v==='number'?Number.isSafeInteger(v)&&v>0&&v<=21474836480?v:null:
+     typeof v==='string'&&/^[1-9][0-9]{0,10}$/.test(v)&&Number(v)<=21474836480?Number(v):null;
+    if(!ext||!response||file.uuid!==expected.uuid||size(file.size)!==expected.metadata.fileSize||
+       file.url!==expected.url||file.httpsUrl!==expected.url||ext.localFileUrl!==expected.url||response.httpsUrl!==expected.url||
+       ext.width!==expected.metadata.width||ext.height!==expected.metadata.height||ext.duration!==expected.metadata.duration||
+       m.url!==expected.url||m.md5sum!==expected.uuid||m.urlCdnTaskId!==expected.task||size(m.fileSize)!==expected.metadata.fileSize||
+       m.width!==expected.metadata.width||m.height!==expected.metadata.height||m.videoPlayLen!==expected.metadata.duration)return null;
+    // Inspect already assigned props, never invoke mediaList/getVideoElement.
+    const consumers=[...seenVM].filter(vm=>Array.isArray(vm._props?.mediaList)&&vm._props.mediaList.length===1&&vm._props.mediaList[0]===file);
+    const full=consumers.filter(vm=>vm.$refs?.video?.tagName==='VIDEO'&&physicalVisible(vm.$refs.video)&&
+       vm.$el&&call(contains,material.$el,vm.$el)&&call(contains,vm.$el,vm.$refs.video));
+    if(consumers.length!==2||full.length!==1)return null;
+    const parent=consumers.filter(vm=>vm!==full[0]&&vm.$refs?.fullScreen===full[0]&&vm.$el&&
+       call(contains,material.$el,vm.$el)&&call(contains,vm.$el,full[0].$el));
+    if(parent.length!==1)return null;
+    restoreVideo=full[0].$refs.video;
+    if(restoreVideo.currentSrc!==expected.url||restoreVideo.src!==expected.url||restoreVideo.getAttribute('src')!==expected.url||
+       restoreVideo.readyState<1||restoreVideo.videoWidth!==expected.metadata.width||
+       restoreVideo.videoHeight!==expected.metadata.height)return null;
+    if(scope.coverRoles){
+     const roles=scope.coverRoles;
+     const covers=[...seenVM].filter(vm=>vm._props?.video===file&&vm.$el&&
+      vm.$el.matches('.cover-preview-wrap')&&physicalVisible(vm.$el)&&call(contains,material.$el,vm.$el)&&
+      ['handleUpdateCover','handleClickEdit'].every(k=>typeof vm[k]==='function'));
+     if(covers.length!==1)return null;
+     for(const [slot,url] of Object.entries(roles)){
+      const key=slot==='cover_portrait'?'coverUrl':slot==='cover_landscape'?'shareCoverUrl':null;
+      if(!key||file[key]!==url||m[key]!==url)return null;
+      const selector=slot==='cover_portrait'?'.vertical-cover-wrap .vertical-img-size':'.horizon-cover-wrap .horizon-img-size';
+      const imgs=[...covers[0].$el.querySelectorAll(selector)].filter(physicalVisible);
+      if(imgs.length!==1||imgs[0].tagName!=='IMG'||!imgs[0].complete||imgs[0].naturalWidth<=0||imgs[0].naturalHeight<=0||
+         imgs[0].src!==url||imgs[0].currentSrc!==url||imgs[0].getAttribute('src')!==url)return null;
+     }
+    }
+    if(scope.thumb && (file.thumbUrl!==scope.thumb||m.thumbUrl!==scope.thumb))return null;
+   }
+   binding={editor,material,url:media[0].url,restoreVideo};return binding;
   };
   const visible=el=>{
    if(!physicalVisible(el))return false;
@@ -116,9 +157,11 @@ _READ = r"""(scope=null) => {
    const current=projectedBinding();
    return !!current && call(contains,current.editor.$el,el);
   };
+  if(scope?.restore&&!projectedBinding())return null;
   for(const el of seenElements){
    if(!visible(el))continue;
    if(el.tagName==='VIDEO'){
+    if(scope?.restore&&el!==projectedBinding().restoreVideo)return null;
     const sources=[...new Set([el.currentSrc,el.src].map(keep).filter(Boolean))];
     const projected=el.ownerDocument!==call(owner,el)||el.getRootNode()!==call(rootNode,el);
     if(projected){const current=projectedBinding();
@@ -165,7 +208,7 @@ def _https_identity(url: object) -> str | None:
     return tc_resource_identity(url)
 
 
-async def tc_reopened_assets_match(page, candidate) -> bool:
+async def tc_reopened_assets_match(page, candidate, *, restored_from=None, cover_roles=None, strict_cover_media=False) -> bool:
     """Require one matching server video and all requested visible covers.
 
     Candidate IDs are already canonical tc-resource hashes from the saved
@@ -188,6 +231,16 @@ async def tc_reopened_assets_match(page, candidate) -> bool:
         if any(value is None for value in slot_ids.values()):
             return False
         custom = any(slot_ids.values())
+        if custom and restored_from is not None and strict_cover_media:
+            session = getattr(page, '_sau_draft_evidence', None)
+            expected = getattr(session, 'expected', None)
+            thumb = candidate.get('tc_thumb_media')
+            # Legacy desc parsing mirrors absent shareCoverUrl from thumbUrl.
+            # With no requested crops, keep that field an automatic thumbnail.
+            if (isinstance(expected, dict) and expected.get('cover_sha256') == {} and
+                    not candidate.get('tc_cover_media') and isinstance(thumb, dict) and
+                    not slot_ids.get('cover_portrait') and slot_ids.get('cover_landscape') == {thumb.get('resource')}):
+                custom = False
         if custom and (set(slot_ids) != _SLOTS or any(not value for value in slot_ids.values())):
             return False
         if not custom and not cover_ids:
@@ -198,18 +251,40 @@ async def tc_reopened_assets_match(page, candidate) -> bool:
         before = page.url
         if not _main(before) or not _main(page.main_frame.url):
             return False
+        source_candidate = restored_from if isinstance(restored_from, dict) else candidate
         session = getattr(page, '_sau_draft_evidence', None)
         scope, bound_record, bound_binding = None, None, None
         if session is not None:
             binding = getattr(session, 'normal_ui_binding', None)
-            record_id, owner = candidate.get('id'), candidate.get('owner')
+            record_id, owner = source_candidate.get('id'), source_candidate.get('owner')
             if (getattr(session, 'platform', None) == 'tencent' and not getattr(session, 'closed', True) and
-                    isinstance(record_id, str) and record_id and candidate.get('fresh') is True and
+                    isinstance(record_id, str) and record_id and source_candidate.get('fresh') is True and
                     owner == getattr(session, 'account', {}).get('uid') and
                     binding == {'id': record_id, 'owner': owner, 'control': 'post_draft_item_edit'} and
-                    any(item == candidate for item in getattr(session, 'saves', []))):
+                    any(item == source_candidate for item in getattr(session, 'saves', []))):
                 scope = {'id': record_id}
-                bound_record, bound_binding = copy.deepcopy(candidate), dict(binding)
+                bound_record, bound_binding = copy.deepcopy(source_candidate), dict(binding)
+                if restored_from is not None:
+                    from uploader.tc_reopen_mapping import _row
+                    row = _row(candidate)
+                    if (not row or candidate.get('id') != record_id or candidate.get('owner') != owner or
+                            not any(item == candidate for item in getattr(session, 'reads', []))):
+                        return False
+                    scope['restore'] = row
+                    if cover_roles is not None:
+                        if (not isinstance(cover_roles, dict) or not cover_roles or set(cover_roles) - _SLOTS or
+                                any(candidate.get('tc_cover_media', {}).get(slot) != {'url': url, 'resource': _https_identity(url)}
+                                    for slot, url in cover_roles.items())):
+                            return False
+                        scope['coverRoles'] = dict(cover_roles)
+                    if strict_cover_media:
+                        thumb = candidate.get('tc_thumb_media', {})
+                        if thumb:
+                            if _https_identity(thumb.get('url')) != thumb.get('resource'):
+                                return False
+                            scope['thumb'] = thumb['url']
+        if restored_from is not None and (scope is None or 'restore' not in scope):
+            return False
         snapshot = await canonical_root_evaluate(page, '(' + _READ + ')(' + json.dumps(scope) + ')')
         if scope and (getattr(page, '_sau_draft_evidence', None) is not session or session.closed or
                 session.platform != 'tencent' or session.account.get('uid') != bound_record['owner'] or

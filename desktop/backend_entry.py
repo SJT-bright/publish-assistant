@@ -32,6 +32,7 @@ def main():
         from uploader.xiaohongshu_uploader.main import XiaoHongShuVideo
         from uploader.ks_uploader.main import KSVideo
         from uploader.tencent_uploader.main import TencentVideo
+        from uploader import upload_pipeline, publication_workflow, xhs_publication_readback, tc_reuse, tc_stage, ks_reopened_assets, tc_sdk_evidence, tc_reopen_mapping, tc_preview_evidence, tc_cover_derivative
         print(json.dumps({'app': 'publish-assistant', 'frozen': bool(getattr(sys, 'frozen', False)),
                           'platform': sys.platform, 'tools': {n: media_tool(n) for n in ('ffmpeg', 'ffprobe')},
                           'imports': True}))

@@ -67,7 +67,10 @@ class ExecutionCheckpointTests(unittest.IsolatedAsyncioTestCase):
         session = DraftEvidenceSession(page, expected['platform_id'], expected,
                                        account_reader=lambda: account(expected['platform_id']))
         page._sau_draft_evidence = session
-        with patch('uploader.xhs_evidence.install_xhs_observer', new=AsyncMock()):
+        # This browser-free Page isolates checkpoint sealing and markers.
+        # Real native observers retain their own local browser fixtures below.
+        with patch('uploader.xhs_evidence.install_xhs_observer', new=AsyncMock()), \
+             patch('uploader.dy_evidence.install_dy_observer',new=AsyncMock()):
             await session.initialize()
         if proven:
             self.prove(session)
@@ -307,19 +310,24 @@ class AdapterResumeTests(unittest.IsolatedAsyncioTestCase):
         from uploader.tencent_uploader.main import TencentVideo
         editor = SimpleNamespace(fill=AsyncMock(), inner_text=AsyncMock(return_value='fixture caption'))
         frame = SimpleNamespace(locator=lambda selector: SimpleNamespace(all=AsyncMock(return_value=[editor])))
-        page = SimpleNamespace(_sau_draft_evidence=SimpleNamespace(closed=False, _checkpoint_restored_at=time.time()),
+        page = SimpleNamespace(_sau_draft_evidence=SimpleNamespace(closed=False, _checkpoint_restored_at=time.time(),
+                               expected={'job_id':'fixture-job','receipt_nonce':'fixture-nonce'}, assets={'video':{'sha256':'fixture-sha'}}),
                                frames=[frame], goto=AsyncMock(side_effect=AssertionError('resume navigation')), context=object())
         for cls, method in ((DouYinVideo, '_upload_draft_content'), (XiaoHongShuVideo, 'upload_video_content'),
                             (KSVideo, '_upload_draft_content'), (TencentVideo, 'upload')):
             with self.subTest(adapter=cls.__name__):
                 app = cls.__new__(cls)
                 app.draft_only, app.title, app.desc, app.tags = True, 'fixture title', 'fixture body', []
+                app.file_path = 'fixture-existing-video.mp4'
                 app.short_title = ''
                 app.draft_expected = {'platform_fields': {'caption': 'fixture caption'}}
                 app.thumbnail_path = app.thumbnail_landscape_path = app.thumbnail_portrait_path = None
                 app.productLink = app.productTitle = None
                 app.fill_meta = AsyncMock()
                 app.fill_title_and_description = AsyncMock()
+                # This test isolates resume dispatch on a synthetic Page;
+                # native browser fixtures retain the actual final text check.
+                app._verify_draft_text_after_upload = AsyncMock()
                 app.close_guide_overlay = AsyncMock()
                 app.validate_upload_args = AsyncMock()
                 app.embedded = SimpleNamespace(page=page, context=page.context, browser=object())
@@ -332,6 +340,8 @@ class AdapterResumeTests(unittest.IsolatedAsyncioTestCase):
                 with patch('uploader.draft_only.assert_draft_safe', new=AsyncMock()), \
                      patch('uploader.draft_only.install_draft_guard', new=AsyncMock()), \
                      patch('uploader.draft_only.save_draft', new=AsyncMock()) as save, \
+                     patch('uploader.draft_only._ui_fields',new=AsyncMock(return_value=True)), \
+                     patch('uploader.tc_stage.restore_tc_native_stage',new=AsyncMock(return_value=None)) as restore_stage, \
                      patch('uploader.draft_only.wait_draft_upload', new=AsyncMock(side_effect=AssertionError('second video wait'))) as wait, \
                      patch('uploader.draft_only.checkpoint_after_upload', new=AsyncMock(return_value=True)) as capture:
                     await getattr(app, method)(object() if cls is TencentVideo else page)
@@ -339,6 +349,8 @@ class AdapterResumeTests(unittest.IsolatedAsyncioTestCase):
                 capture.assert_awaited_once()
                 page.goto.assert_not_awaited()
                 if cls is TencentVideo:
+                    restore_stage.assert_awaited_once_with(page,app.file_path,page._sau_draft_evidence.assets['video'],
+                                                          {'job_id':'fixture-job','receipt_nonce':'fixture-nonce'})
                     app.open_upload_page.assert_not_awaited()
                     app.upload_video_file.assert_not_awaited()
                     app.wait_for_upload_complete.assert_not_awaited()
@@ -349,11 +361,11 @@ class AdapterResumeTests(unittest.IsolatedAsyncioTestCase):
                     save.assert_awaited_once()
 
     async def test_bilibili_real_method_skips_native_input_and_wait_but_fills(self):
-        page = SimpleNamespace(_sau_draft_evidence=SimpleNamespace(closed=False, _checkpoint_restored_at=time.time()))
-        title = SimpleNamespace(fill=AsyncMock(), input_value=AsyncMock(return_value='fixture title'))
-        desc = SimpleNamespace(fill=AsyncMock())
-        with patch('draft_execution.find_control', new=AsyncMock(return_value=title)) as find_title, \
-             patch('draft_execution.find_control_priority', new=AsyncMock(return_value=desc)) as find_desc, \
+        page = SimpleNamespace(_sau_draft_evidence=SimpleNamespace(closed=False, _checkpoint_restored_at=time.time(),
+                               bili_observer=SimpleNamespace(ensure_ready=AsyncMock(return_value=True))))
+        with patch('uploader.bili_controls.bili_empty_video_control',new=AsyncMock(side_effect=AssertionError('second native input'))) as video, \
+             patch('uploader.bili_controls.bili_wait_uploaded',new=AsyncMock(side_effect=AssertionError('second wait'))) as wait_native, \
+             patch('uploader.bili_controls.bili_fill_content',new=AsyncMock()) as fill, \
              patch('draft_execution.set_local_files', new=AsyncMock(side_effect=AssertionError('second native upload'))) as upload, \
              patch('uploader.draft_only.wait_draft_upload', new=AsyncMock(side_effect=AssertionError('second wait'))) as wait, \
              patch('uploader.draft_only.assert_draft_safe', new=AsyncMock()), \
@@ -363,10 +375,9 @@ class AdapterResumeTests(unittest.IsolatedAsyncioTestCase):
                                           None, page=page)
         upload.assert_not_awaited()
         wait.assert_not_awaited()
-        find_title.assert_awaited_once()
-        find_desc.assert_awaited_once()
-        title.fill.assert_awaited_once_with('fixture title')
-        desc.fill.assert_awaited_once_with('fixture body')
+        video.assert_not_awaited()
+        wait_native.assert_not_awaited()
+        fill.assert_awaited_once_with(page,'fixture title','fixture body',[])
         capture.assert_awaited_once()
         save.assert_awaited_once()
 
@@ -377,6 +388,46 @@ class ExecutionCheckpointBrowserTests(unittest.IsolatedAsyncioTestCase):
     expected = evidence_fixtures.BrowserEvidenceTests.expected
     setup_dy = evidence_fixtures.BrowserEvidenceTests.setup_dy
     wait_fingerprints = evidence_fixtures.BrowserEvidenceTests.wait_fingerprints
+
+    async def mount_dy_native_composer(self):
+        """Model the committed media consumer rather than editable data IDs.
+
+        Upload bytes and checkpoint signatures still come from the native
+        input/HTTP fixture. This locally routed composer represents decoded
+        media state and loaded cover images for the actual read-only readers.
+        """
+        from tests.test_dy_cover_readback import TINY_PNG
+        # Current dual-cover cards carry distinct raw resource identities.
+        self.html=self.html.replace('coverHorizontalInfo:{uri:cfg.cover}',
+                                    'coverHorizontalInfo:{uri:"default-cover-horizontal"}')
+        await self.context.route('https://fixture.invalid/checkpoint-*.png',
+                                 lambda route:route.fulfill(content_type='image/png',body=TINY_PNG))
+        await self.page.goto('https://creator.douyin.com/creator-micro/content/post/video?checkpoint-fixture=1')
+        await self.page.evaluate('''()=>{
+          const container=document.createElement('div');container.id='root';window.editor.append(container);
+          const video=document.createElement('video');video.src='https://fixture.invalid/checkpoint-decoded-video.mp4';
+          video.style='width:320px;height:180px';container.append(video);
+          for(const [key,value] of Object.entries({currentSrc:video.src,readyState:4,videoWidth:320,videoHeight:180,duration:6}))
+            Object.defineProperty(video,key,{value,writable:true});
+          const host={tag:5,stateNode:video},player={tag:0,child:host,
+            memoizedProps:{currentVideo:{vid:'new-video'},width:320,height:180,playUrl:video.src}};
+          let previous=player;
+          for(const direction of ['portrait','landscape']){
+            const card=document.createElement('div');card.className='coverControl-fixture';card.style='width:180px;height:140px';
+            const label=document.createElement('span');label.textContent=direction==='portrait'?'竖封面3:4':'横封面4:3';
+            const image=document.createElement('img');image.src='https://fixture.invalid/checkpoint-'+direction+'.png';
+            image.style='width:100px;height:100px';card.append(label,image);container.append(card);
+            const imageHost={tag:5,stateNode:image,memoizedProps:{src:image.src}},imageComponent={tag:0,child:imageHost,memoizedProps:{src:image.src}};
+            const cardHost={tag:5,stateNode:card,child:imageComponent},fiber={tag:0,child:cardHost,
+              memoizedProps:{className:'coverControl-fixture',coverInfo:{uri:direction==='portrait'?'default-cover':'default-cover-horizontal'},disabled:false,
+                durationStr:'00:06',handleEditCover(){},showOperation:true}};
+            previous.sibling=fiber;previous=fiber;
+          }
+          const fiberRoot={containerInfo:container},current={tag:3,stateNode:fiberRoot,child:player};fiberRoot.current=current;
+          Object.defineProperty(container,'__reactContainer$checkpoint',{value:{tag:3,stateNode:fiberRoot}});
+          window.checkpointPlayer=player;
+        }''',isolated_context=False)
+        await self.page.wait_for_function('Array.from(document.querySelectorAll("#root img")).every(i=>i.complete&&i.naturalWidth===1)')
 
     def runtime_paths(self, filename='upload-checkpoint.json'):
         key = Path(self.directory.name) / 'private.key'
@@ -403,6 +454,7 @@ class ExecutionCheckpointBrowserTests(unittest.IsolatedAsyncioTestCase):
         runtime = execution.ExecutionCheckpoint(key, output)
         runtime.bind(self.page, old)
         self.assertTrue(await checkpoint_after_upload(self.page))
+        await self.mount_dy_native_composer()
         await self.page.evaluate("window.media.dataset.videoId='new-video';window.preview.dataset.coverId='default-cover'", isolated_context=False)
         await self.page.locator('#body').fill('')
         await end_draft_verification(self.page)
@@ -447,7 +499,7 @@ class ExecutionCheckpointBrowserTests(unittest.IsolatedAsyncioTestCase):
                 await save_draft(self.page, '抖音', expected['title'], button_timeout=1, receipt_timeout=1, expected=expected)
         action.assert_not_awaited()
 
-    async def test_read_only_composer_rejects_blob_multiple_and_accepts_open_shadow_exact_resource(self):
+    async def test_read_only_composer_rejects_unowned_media_and_accepts_bound_shadow_native_resource(self):
         expected = self.expected()
         await self.page.goto('http://127.0.0.1:45997/resume-composer')
         proof = {'identity': {'platform_id': 'tencent'}, 'upload_links': [
@@ -456,10 +508,30 @@ class ExecutionCheckpointBrowserTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await read_checkpoint_composer_media(self.page, proof))
         await self.page.set_content('<div data-video-id="known-video">one</div><div data-video-id="other-video">two</div>')
         self.assertIsNone(await read_checkpoint_composer_media(self.page, proof))
-        await self.page.set_content('<div id="host"></div>')
-        await self.page.evaluate("document.getElementById('host').attachShadow({mode:'open'}).innerHTML='<div data-video-id=known-video style=\"width:100px;height:30px\">video</div>'", isolated_context=False)
+        # A data attribute cannot replace the mounted MaterialEdit/native File
+        # consumer. Use the official-shaped component fixture for the positive
+        # case; its Blob preview binds to the sealed DFS response resource.
+        from tests.test_tc_editor import FIXTURE
+        from tests.test_tc_resource import resource
+        from uploader.tc_resource import tc_resource_identity
+        proof['upload_links'][0]['ids']=[tc_resource_identity(resource())]
+        await self.context.route('https://channels.weixin.qq.com/**',
+                                 lambda route:route.fulfill(content_type='text/html',body=FIXTURE))
+        await self.page.goto('https://channels.weixin.qq.com/platform/post/create')
+        await self.page.evaluate('''async urls=>{
+          const vm=makeMaterial(['done']),old=vm.fileList[0],file={originFileObj:old.originFileObj,isVideo:true,isImage:false,
+            isValid:true,status:'done',thumbUrl:old.thumbUrl,response:{DownloadURL:urls[0],httpsUrl:urls[1]},httpsUrl:urls[1]};
+          file.url=URL.createObjectURL(new Blob(['isolated video fixture'],{type:'video/mp4'}));
+          vm.fileList=[file];vm.$refs.postUpload.value=[file];window.material=vm;document.querySelector('#main').__vue__=vm;
+          const shadow=document.querySelector('#shadow-host').attachShadow({mode:'open'}),video=document.createElement('video');
+          video.width=320;video.height=180;window.preview=video;shadow.append(video);
+          await new Promise(resolve=>{video.onerror=resolve;video.onloadedmetadata=resolve;video.src=file.url;});
+        }''',[resource(origin='http://wxapp.tc.qq.com'),resource()],isolated_context=False)
         result = await read_checkpoint_composer_media(self.page, proof)
-        self.assertEqual(result, {'source': 'platform_composer', 'video_count': 1, 'video_ids': ['known-video']})
+        self.assertEqual(result, {'source':'platform_composer','video_count':1,'video_ids':[tc_resource_identity(resource())]})
+        await self.page.evaluate('()=>preview.parentNode.append(preview.cloneNode())',isolated_context=False)
+        self.assertIsNone(await read_checkpoint_composer_media(self.page,proof))
+        self.assertEqual(await self.page.evaluate('window.calls',isolated_context=False),{'business':0,'mutable':0,'private':0})
 
 
 if __name__ == '__main__':

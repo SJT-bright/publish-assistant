@@ -457,6 +457,24 @@ test('a stale frame does not replace a newer cover, and an unapplied seek captur
   assert.equal(harness.material.cover_generated, false);
 });
 
+test('reset cancels pending covers, text and frames even when the video was already empty', async () => {
+  const harness=materialHarness(),{document}=harness;
+  const bytes=deferredBytes('迟到的标题');harness.window.draftDesktop=null;
+  document.querySelector('[data-text-drop="title"]').fire('drop',{dataTransfer:{types:['Files'],files:[{name:'旧.txt',size:12,type:'text/plain',arrayBuffer:()=>bytes.promise}]}});
+  harness.window.draftDesktop={filePath:file=>file.path};
+  document.querySelector('[data-cover-slot="common"]').fire('drop',{dataTransfer:{types:['Files'],files:[{name:'旧.png',path:'/fixture/old.png',type:'image/png'}]}});
+  await flush();const cover=harness.jobs.find(job=>job.url==='/api/cover');
+  harness.editor.reset();document.getElementById('title').value='';
+  bytes.finish();cover.resolve('/fixture/old.png');await flush();
+  assert.equal(document.getElementById('title').value,'');assert.equal(harness.covers.length,0);
+  readyVideo(harness);document.getElementById('captureFrame').fire('click');await flush();
+  const frame=harness.jobs.find(job=>job.url==='/api/frame');harness.editor.reset();
+  frame.resolve({path:'/fixture/stale.jpg',time:1,width:160,height:90});await flush();
+  assert.equal(harness.covers.length,0);assert.equal(harness.videoPlayer.hidden,true);
+  assert.equal(document.getElementById('captureFrame').disabled,true);
+  assert.equal(harness.videoPlayer.getAttribute('src'),null);
+});
+
 test('an unfinished seek does not stick after the video changes', async () => {
   const harness = materialHarness();
   const { document } = harness;

@@ -95,7 +95,18 @@ function createBackendManager({baseURL, port, start, probe = ms => probeBackend(
       if (listening === false && !started) {
         started = true;
         try { await start(); }
-        catch { throw connectionError('BACKEND_START_FAILED', '后台未能启动，请查看运行记录。'); }
+        catch (error) {
+          // A timed-out protected-folder open never called spawn; its late FD
+          // is closed by the I/O helper. Only that explicit case can retry.
+          if(error?.backendNotStarted === true) {
+            started=false;
+            if(error.code==='CONNECTION_CLOSED')throw error;
+            throw connectionError(error.code==='PRIVATE_DATA_TIMEOUT'?'PRIVATE_DATA_TIMEOUT':'PRIVATE_DATA_UNAVAILABLE',
+              error.code==='PRIVATE_DATA_TIMEOUT' ? '草稿资料目录访问超时；macOS 可能正在等待“下载”文件夹授权，完成系统提示后可重新连接工作台。' :
+              '草稿资料目录暂时无法访问，请检查系统提示或目录访问情况后重新连接工作台。');
+          }
+          throw connectionError('BACKEND_START_FAILED', '后台未能启动，请查看运行记录。');
+        }
       }
       if (now() < deadline) await sleep(Math.min(retryDelayMs, deadline - now()));
     }

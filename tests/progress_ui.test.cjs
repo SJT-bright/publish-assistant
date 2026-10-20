@@ -89,6 +89,14 @@ test('active task platform owns the strip even while the user looks at another p
   assert.equal(h.elements.progressPlatform.textContent,'平台 2/4 · 视频号');
   h.render(snapshot(),'workbench');assert.equal(h.elements.progressPlatform.textContent,'平台 2/4 · 视频号');
 });
+test('finished upload from another platform is hidden on the current native page',()=>{
+  const h=shellHarness(),record=snapshot({active:false,status:'result_unknown'},{stage:'upload',state:'failed',completed:['session','video','content','cover']});
+  h.render(record,'kuaishou');
+  assert.equal(h.elements.taskProgress.hidden,true);
+  assert.equal(h.document.body.classList.contains('has-task-progress'),false);
+  h.render(record,'tencent');assert.equal(h.elements.taskProgress.hidden,false);
+  h.render(record,'workbench');assert.equal(h.elements.taskProgress.hidden,false);
+});
 test('new platform and new task reset completed segments and the step wait',()=>{
   const h=shellHarness();h.render(snapshot({}, {stage:'save',completed:['session','video','upload','content','cover']}));
   h.advance(20);assert.equal(h.elements.progressWait.textContent,'已等待 00:20');
@@ -218,13 +226,10 @@ test('platform sequence and completed step count have distinct labels and honest
   assert.equal(h.elements.progressCount.textContent,'已完成 4/7 步 · 跳过 1 步');
   assert.match(h.elements.progressDetail.textContent,/已完成 4 步 · 跳过 1 步/);
 });
-test('recent task on a different browsed page is labelled historical instead of implying that page is executing',()=>{
+test('recent task on a different browsed page is hidden instead of implying that page is executing',()=>{
   const h=shellHarness();h.render(snapshot({active:false,status:'result_unknown',platform:'xiaohongshu',platform_name:'小红书',platform_index:1,platform_count:3}), 'bilibili');
   assert.equal(h.elements.heading.textContent,'B站');
-  assert.equal(h.elements.progressScope.textContent,'最近任务');
-  assert.equal(h.elements.progressPlatform.textContent,'平台 1/3 · 小红书');
-  assert.match(h.elements.progressDetail.textContent,/当前浏览 B站；以上是最近的小红书任务记录/);
-  assert.match(h.elements.progressSteps.getAttribute('aria-valuetext'),/^最近任务；平台 1\/3 · 小红书/);
+  assert.equal(h.elements.taskProgress.hidden,true);
   h.render(snapshot({active:false,status:'result_unknown'}), 'tencent');
   assert.equal(h.elements.progressScope.textContent,'最近任务');
   assert.doesNotMatch(h.elements.progressDetail.textContent,/当前浏览/);
@@ -232,13 +237,13 @@ test('recent task on a different browsed page is labelled historical instead of 
 test('legacy history explicitly says no step records and cannot infer zero or full completion even from a verified result',()=>{
   const h=shellHarness();
   for(const status of ['result_unknown','platform_draft_verified']){
-    h.render(snapshot({active:false,status,progress:null}), 'bilibili');
+    h.render(snapshot({active:false,status,progress:null}), 'tencent');
     assert.equal(h.elements.progressScope.textContent,'最近任务');
     assert.equal(h.elements.progressCount.textContent,'历史任务 · 无步骤记录');
     assert.equal(h.elements.progressSteps.getAttribute('aria-valuenow'),null);
     assert.ok(h.elements.progressSteps.children.every(node=>node.dataset.state==='unrecorded'));
     assert.doesNotMatch(h.elements.progressCount.textContent,/0\/7|7\/7|100%/);
-    assert.match(h.elements.progressDetail.textContent,/当前浏览 B站；以上是最近的视频号任务记录/);
+    assert.doesNotMatch(h.elements.progressDetail.textContent,/当前浏览/);
   }
 });
 test('a live legacy task and a disconnected last observation keep their distinct context labels',()=>{
@@ -262,7 +267,7 @@ function mainHarness(fetchImpl=async()=>({ok:true,status:200,json:async()=>({ava
   const handlers=new Map(),writes=[];
   const app={isPackaged:false,getVersion:()=> 'isolated-test',getPath:()=>'/isolated-test-profile',setPath:()=>{},setName:()=>{},setAboutPanelOptions:()=>{},
     commandLine:{appendSwitch:()=>{}},requestSingleInstanceLock:()=>false,quit:()=>{},on:()=>{}};
-  const fakeFs={...fs,mkdirSync:()=>{},writeFileSync:(...args)=>{writes.push(args);}};
+  const fakeFs={...fs,mkdirSync:()=>{},promises:{mkdir:async()=>{},writeFile:async(...args)=>{writes.push(args);},chmod:async()=>{},rename:async()=>{},unlink:async()=>{}},writeFileSync:(...args)=>{writes.push(args);}};
   const sandbox={require:name=>name==='electron'?{app,ipcMain:{handle:(name,handler)=>handlers.set(name,handler)}}:name==='node:fs'?fakeFs:require(name),__dirname:path.join(root,'desktop'),
     process:{env:{},pid:123,exit:()=>{throw new Error('Unexpected exit');}},console,fetch:fetchImpl,AbortSignal,
     setTimeout,clearTimeout,setInterval:()=>({unref:()=>{}}),clearInterval};
@@ -314,6 +319,9 @@ test('workbench, platform, and login popup bounds all reserve the same dynamic s
   records.length=0;api.set(snapshot());api.layout();
   assert.equal(records.length,3);assert.ok(records.every(entry=>entry.x===224 && entry.y===216 && entry.width===876 && entry.height===484));
   api.set({available:true,connected:true,job:null});records.length=0;api.layout();assert.ok(records.every(entry=>entry.y===76));
+  api.set(snapshot({active:false,status:'result_unknown'}));api.selected('bilibili');records.length=0;api.layout();
+  assert.ok(records.every(entry=>entry.y===76 && entry.height===624));
+  api.selected('tencent');records.length=0;api.layout();assert.ok(records.every(entry=>entry.y===216));
 });
 
 function zoomMocks(api,width=1320,height=868){
@@ -421,4 +429,27 @@ test('shell zoom controls expose fit and manual modes, retain accessibility, and
   h.state({selected:'bilibili'});assert.equal(h.elements.fitPage.disabled,true);assert.equal(h.elements.zoomValue.textContent,'—');
   assert.match(html,/id="pageZoom"[^>]*role="group"[^>]*aria-label=/);
   assert.match(html,/id="zoomValue"[^>]*aria-live="polite"/);
+});
+
+test('overlapping upload and content remain visible with both operation rows',()=>{
+  const h=shellHarness();
+  h.render(snapshot({}, {stage:'content',active_stages:['upload','content'],operations:{
+    upload:{plan:['transfer'],completed:[],skipped:[],current:'transfer',state:'running',percent:82},
+    content:{plan:['title','description'],completed:['title'],skipped:[],current:'description',state:'running'}}}));
+  assert.equal(h.node('upload').dataset.state,'running');assert.equal(h.node('content').dataset.state,'running');
+  assert.match(h.elements.progressStage.textContent,/上传.* ＋ .*填写/);
+  assert.ok(h.elements.progressOperations.children.some(node=>node.textContent.includes('82%')));
+  assert.ok(h.elements.progressOperations.children.some(node=>node.textContent.includes('填写文案')));
+});
+test('publication submission shows review state without claiming public visibility',()=>{
+  const h=shellHarness();h.render(snapshot({action:'publish',active:false,status:'published_submission_verified'},{stage:'verify',state:'completed'}));
+  assert.match(h.elements.progressStage.textContent,/投稿已提交.*等待平台审核/);
+  assert.match(h.node('save').textContent,/提交投稿/);assert.match(h.node('verify').textContent,/核验投稿回执/);
+});
+test('page-operation loading remains visible until a real terminal state',()=>{
+  const h=shellHarness();h.state({selected:'tencent',zoom:{available:true},pageOperation:{kind:'reload',status:'running',startTime:100000,detail:'等待页面内容'}});
+  assert.equal(h.elements.reload.disabled,true);assert.equal(h.elements.reload.getAttribute('aria-busy'),'true');
+  h.advance(4);assert.match(h.elements.address.textContent,/00:04/);
+  h.state({selected:'tencent',zoom:{available:true},pageOperation:{kind:'reload',status:'completed',startTime:100000,finishedTime:104000,detail:'页面加载完成'}});
+  assert.equal(h.elements.reload.getAttribute('aria-busy'),'false');assert.match(h.elements.address.textContent,/页面加载完成/);
 });

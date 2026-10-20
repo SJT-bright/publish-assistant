@@ -155,6 +155,8 @@ def _checkpoint_expected_identity(expected, platform):
         fingerprint = {key: identity[key] for key in ('platform_id', 'account_key', 'video_sha256', 'content_sha256', 'cover_sha256')}
         if canonical_sha(content) != identity['content_sha256']:
             raise CheckpointError('checkpoint_content_mismatch')
+        if expected.get('workflow_action') == 'publish':
+            fingerprint['workflow_action'] = 'publish'
         if canonical_sha(fingerprint) != identity['operation_key']:
             raise CheckpointError('checkpoint_operation_mismatch')
     except (KeyError, TypeError):
@@ -292,7 +294,7 @@ def parse_record(platform, raw, record_id=None, owner=None):
     if not isinstance(raw, dict):
         return None
     draft_id, uid, title, description, caption, tags, short_title = record_id, owner, None, None, None, None, None
-    video_ids, cover_ids, cover_slots, video_count = [], [], {}, 0
+    video_ids, cover_ids, cover_slots, video_count, extra = [], [], {}, 0, {}
     if p == 'douyin':
         cache = raw.get('cache', raw)
         if not isinstance(cache, dict):
@@ -398,8 +400,20 @@ def parse_record(platform, raw, record_id=None, owner=None):
         if not isinstance(media, list):
             return None
         video_count = len(media)
+        media_tasks, media_rows = [], []
         for video in media:
             if isinstance(video, dict):
+                from uploader.tc_reopen_mapping import canonical_media
+                row = canonical_media(video)
+                if row is not None:
+                    media_rows.append(row)
+                if 'urlCdnTaskId' in video:
+                    from uploader.tc_resource import tc_resource_identity
+                    resource = tc_resource_identity(video.get('url'))
+                    task = video.get('urlCdnTaskId')
+                    if not resource or not _tc_scalar(task):
+                        return None
+                    media_tasks.append({'resource': resource, 'draft_id': task})
                 video_ids.extend(_tc_stored_ids(video.get('url'), video.get('fileId'), video.get('videoId')))
                 cover_ids.extend(_tc_stored_ids(video.get('thumbUrl'), video.get('coverUrl'), video.get('shareCoverUrl')))
                 # The official cover editor writes coverUrl for the personal
@@ -409,12 +423,30 @@ def parse_record(platform, raw, record_id=None, owner=None):
                 cover_slots['cover_landscape'] = _tc_stored_ids(video.get('shareCoverUrl'))
                 if not current_schema and not video.get('shareCoverUrl'):
                     cover_slots['cover_landscape'] = _tc_stored_ids(video.get('thumbUrl'))
+        if media_tasks:
+            extra['tc_media_tasks'] = media_tasks
+        if len(media_rows) == len(media) and media_rows:
+            extra['tc_media'] = media_rows
+        if len(media) == 1 and isinstance(media[0], dict):
+            from uploader.tc_resource import tc_resource_identity
+            cover_media = {}
+            for slot, key in (('cover_portrait', 'coverUrl'), ('cover_landscape', 'shareCoverUrl')):
+                resource = tc_resource_identity(media[0].get(key))
+                if resource:
+                    cover_media[slot] = {'url': media[0][key], 'resource': resource}
+            if cover_media:
+                extra['tc_cover_media'] = cover_media
+            thumbnail = tc_resource_identity(media[0].get('thumbUrl'))
+            if thumbnail:
+                extra['tc_thumb_media'] = {'url': media[0]['thumbUrl'], 'resource': thumbnail}
+        if type(raw.get('handleStatus')) is int:
+            extra['tc_handle_status'] = raw['handleStatus']
     else:
         return None
     return {'id': str(draft_id) if draft_id is not None else '', 'owner': str(uid) if uid is not None else '',
             'title': title, 'description': description, 'caption': caption, 'tags': tags,
             'short_title': short_title, 'video_ids': sorted(set(video_ids)), 'cover_ids': sorted(set(cover_ids)),
-            'cover_slots': cover_slots, 'video_count': video_count}
+            'cover_slots': cover_slots, 'video_count': video_count, **extra}
 
 
 def field_match(platform, record, expected):
@@ -442,7 +474,7 @@ def field_match(platform, record, expected):
     return False
 
 
-def verify_evidence(platform, expected, record, links, account, reopened=None, ui_fields=False, account_after=None):
+def verify_evidence(platform, expected, record, links, account, reopened=None, ui_fields=False, account_after=None, tc_processing_mapping=None):
     """Pure verification, used by browser observations and local fixtures."""
     result = dict.fromkeys(CHECKS, False)
     reasons = []
@@ -471,10 +503,17 @@ def verify_evidence(platform, expected, record, links, account, reopened=None, u
                              (not record.get('owner') or str(account.get('uid')) == str(record['owner'])))
     if reopened:
         after = account_after or {}
+        mapping_ok = False
+        if platform_id(platform) == 'tencent' and tc_processing_mapping is not None:
+            from uploader.tc_reopen_mapping import TCVerifiedProcessingReopen
+            mapping_ok = (isinstance(tc_processing_mapping, TCVerifiedProcessingReopen) and
+                tc_processing_mapping.matches(expected, record, reopened, links, account, after))
+        same_media = (reopened.get('video_ids') == record.get('video_ids') and
+                      (platform_id(platform) != 'tencent' or reopened.get('tc_media_tasks') == record.get('tc_media_tasks')))
         result['reopened'] = bool(ui_fields is True and reopened.get('id') == record.get('id') and
-                                  reopened.get('video_ids') == record.get('video_ids') and
-                                  reopened.get('cover_ids') == record.get('cover_ids') and
-                                  reopened.get('cover_slots') == record.get('cover_slots') and
+                                  (mapping_ok or same_media and
+                                   reopened.get('cover_ids') == record.get('cover_ids') and
+                                   reopened.get('cover_slots') == record.get('cover_slots')) and
                                   field_match(platform, reopened, expected) and
                                   after.get('verified') is True and after.get('identity') == account.get('identity'))
     for key, okay in result.items():
@@ -702,7 +741,7 @@ def _tc_draft_list_records(value, owner):
     return records
 
 
-def _tc_draft_diagnostic(kind, status, body, data, record=None):
+def _tc_draft_diagnostic(kind, status, body, data, record=None, *, list_gate=None):
     """Project fixed structural fields only; never serialize protocol values."""
     if kind not in ('save', 'read', 'readlist'):
         return
@@ -725,6 +764,8 @@ def _tc_draft_diagnostic(kind, status, body, data, record=None):
              'base_codes': {key: base[key] for key in ('errcode',) if type(base.get(key)) is int},
              'response_ok': _response_ok('tencent', data), 'parsed_record': record is not None,
              'record_id_present': bool(record and record.get('id'))}
+    if kind == 'readlist' and isinstance(list_gate, dict):
+        shape['list_gate'] = list_gate
     try:
         print('DRAFT_DIAGNOSTIC=' + json.dumps(shape), flush=True)
     except Exception:
@@ -861,6 +902,117 @@ def _tc_no_error(data):
                ('retcode', 'X-Errno', 'errCode', 'code', 'errorcode') if key in data)
 
 
+def _tc_part_number(value):
+    if type(value) is int and value > 0:
+        return value
+    if isinstance(value, str) and re.fullmatch(r'[1-9][0-9]*', value):
+        return int(value)
+    return None
+
+
+def _tc_confirm_exchange(base, response, data, query, body):
+    """The SDK's observed ListPartsResult is not a new allocation.
+
+    The preserved official client (SHA256 022cd6da6b8f3afed8aded29b19aed5c3
+    60ea504784cd69c969c6e3578d7198b, offsets 879303, 879576, 881517) starts
+    PartNumberMarker="1", follows NextPartNumberMarker while IsTruncated is
+    "true", and copies each server ETag verbatim over its quick-upload ETag.
+    No URL decoding, whitespace trimming or quote removal is performed.
+    """
+    upload_id, marker = query.get('UploadID'), query.get('PartNumberMarker')
+    result = data.get('ListPartsResult')
+    if (response.request.method not in ('PUT', 'GET') or body or
+            not _tc_scalar(upload_id) or _tc_part_number(marker) is None or
+            not isinstance(result, dict)):
+        return None
+    parts, truncated = result.get('Part'), result.get('IsTruncated')
+    if not isinstance(parts, list) or not parts or truncated not in ('true', 'false'):
+        return None
+    projection = []
+    for part in parts:
+        if not isinstance(part, dict) or _tc_part_number(part.get('PartNumber')) is None or not _tc_scalar(part.get('ETag')):
+            return None
+        projection.append((_tc_part_number(part['PartNumber']), part['ETag']))
+    if [number for number, _ in projection] != sorted({number for number, _ in projection}):
+        return None
+    next_marker = result.get('NextPartNumberMarker')
+    if truncated == 'true':
+        if _tc_part_number(next_marker) is None or int(next_marker) <= int(marker):
+            return None
+        next_marker = str(next_marker)
+    elif next_marker not in (None, ''):
+        return None
+    return {**base, 'stage': 'confirmed', 'upload_id': upload_id, 'marker': str(marker),
+            'next_marker': next_marker, 'truncated': truncated == 'true', 'parts': projection}
+
+
+def _tc_confirmed_parts(allocation, finish, exchanges, chunks, *, sdk_completed=False):
+    confirmations = [item for item in exchanges if item.get('stage') == 'confirmed' and
+                     item['task_id'] == allocation['task_id'] and item['upload_id'] == allocation['upload_id'] and
+                     item['metadata'] == allocation['metadata'] and
+                     allocation['observed_at'] <= item['observed_at'] <= finish['observed_at']]
+    if not confirmations:
+        return False, None
+    # Quick-upload confirmation is a later step than all observed current
+    # chunks. Old confirmation pages or a later response cannot repair it.
+    if not chunks or not sdk_completed and max(item['observed_at'] for item in chunks) > min(item['observed_at'] for item in confirmations):
+        return True, None
+    pages = {}
+    for item in confirmations:
+        pages.setdefault(item['marker'], []).append(item)
+    marker, visited, parts, prior_at = '1', set(), {}, allocation['observed_at']
+    while marker not in visited and marker in pages:
+        visited.add(marker)
+        candidates = pages[marker]
+        signatures = {(tuple(item['parts']), item['truncated'], item['next_marker']) for item in candidates}
+        if len(signatures) != 1:
+            return True, None
+        page = min(candidates, key=lambda item: item['observed_at'])
+        if page['observed_at'] < prior_at:
+            return True, None
+        prior_at = max(item['observed_at'] for item in candidates)
+        for number, etag in page['parts']:
+            if number in parts and parts[number] != {etag}:
+                return True, None
+            parts[number] = {etag}
+        if not page['truncated']:
+            expected = set(range(1, len(allocation['plan']) + 1))
+            coverage = set(parts).issubset(expected) if sdk_completed else set(parts) == expected
+            if visited != set(pages) or not coverage:
+                return True, None
+            return True, parts
+        marker = page['next_marker']
+    return True, None
+
+
+def _tc_dfs_chain_projection(allocation, finish, exchanges):
+    """Private exact comparison shared by proof and content-free diagnostics."""
+    matching = [item for item in exchanges if 'part_number' in item and
+                item['task_id'] == allocation['task_id'] and item['upload_id'] == allocation['upload_id'] and
+                item['metadata'] == allocation['metadata']]
+    chunks = [item for item in matching if allocation['observed_at'] <= item['observed_at'] <= finish['observed_at']]
+    observed = {}
+    for chunk in chunks:
+        observed.setdefault(chunk['part_number'], set()).add(chunk['etag'])
+    expected = {number: {etag} for number, etag in finish['parts']}
+    has_confirmation, confirmed = _tc_confirmed_parts(allocation, finish, exchanges, chunks)
+    coverage = set(observed) == set(range(1, len(allocation['plan']) + 1)) and all(len(etags) == 1 for etags in observed.values())
+    etags_match = (confirmed == expected) if has_confirmation else observed == expected
+    diagnostics = {
+        'part_count_matches_plan': len(finish['parts']) == len(allocation['plan']),
+        'observed_part_count': len(observed), 'finish_part_count': len(finish['parts']),
+        'observed_part_etag_counts': [len(observed.get(number, set())) for number in sorted(expected)],
+        'raw_etag_exact_matches': sum(observed.get(number) == etags for number, etags in expected.items()),
+        'part_etags_match': etags_match, 'fresh_part_coverage': coverage,
+        'confirmation_present': has_confirmation, 'confirmation_chain_valid': confirmed is not None,
+        'confirmed_etag_exact_matches': sum((confirmed or {}).get(number) == etags for number, etags in expected.items()),
+        'part_received_after_finish_count': sum(item['observed_at'] > finish['observed_at'] for item in matching),
+        'part_flag_matches': any(item.get('trans_flag') == finish['trans_flag'] for item in chunks),
+        'part_flags_present': sum(item.get('trans_flag') is not None for item in chunks),
+    }
+    return chunks, diagnostics
+
+
 async def _tc_dfs_header_diagnostics(request):
     """Compare header availability without returning or recording their values."""
     def project(headers):
@@ -949,8 +1101,9 @@ def _tc_upload_exchange(response, data, observed_at, sns_fields=None, *, allowed
     base.update(metadata=metadata, task_id=fields['taskid'])
     body = _request_body(response.request)
     if endpoint == 'allocate':
-        # Confirmation of an old UploadID is not a fresh allocation.
-        if response.request.method != 'PUT' or query.get('UploadID') or not _tc_scalar(data.get('UploadID')):
+        if query.get('UploadID'):
+            return _tc_confirm_exchange(base, response, data, query, body)
+        if response.request.method != 'PUT' or not _tc_scalar(data.get('UploadID')):
             return None
         count, ends = body.get('BlockSum'), body.get('BlockPartLength')
         if type(count) is not int or count <= 0 or not isinstance(ends, list) or len(ends) != count:
@@ -1020,7 +1173,10 @@ class DraftEvidenceSession:
         self.handler = self._response
         self.xhs_observer = None
         self.tc_cover_observer = None
+        self.tc_preview_observer = None
+        self.tc_first_target_gate = None
         self.tc_processing_observer = None
+        self.tc_sdk_observer = None
         self.ks_observer = None
         self.bili_observer = None
         self.dy_observer = None
@@ -1100,6 +1256,10 @@ class DraftEvidenceSession:
             await install_tc_cover_observer(self)
             from uploader.tc_processing import install_tc_processing_observer
             await install_tc_processing_observer(self)
+            from uploader.tc_sdk_evidence import install_tc_sdk_observer
+            await install_tc_sdk_observer(self)
+            from uploader.tc_preview_evidence import TCPreviewObserver
+            self.tc_preview_observer = TCPreviewObserver(self)
         elif self.platform == 'kuaishou':
             from uploader.ks_evidence import install_ks_observer
             await install_ks_observer(self)
@@ -1129,6 +1289,9 @@ class DraftEvidenceSession:
 
     async def _observe(self, response):
         observed_at = time.time()
+        if self.tc_preview_observer is not None and await self.tc_preview_observer.observe(response, observed_at):
+            print('DRAFT_DIAGNOSTIC=' + json.dumps(self.tc_preview_observer.diagnostic()), flush=True)
+            return
         if self.platform == 'bilibili':
             # Only the native CDP transport owns Bili request time/frame proof.
             # Generic responses must not synthesize a saved record from a body.
@@ -1188,6 +1351,8 @@ class DraftEvidenceSession:
                 pass
         if not kind and not stage and not tc_endpoint:
             return
+        if self.platform == 'tencent' and kind == 'readlist' and self.tc_preview_observer is not None and not self.tc_preview_observer.current():
+            return
         try:
             if not 200 <= response.status < 300:
                 if self.platform == 'tencent' and kind:
@@ -1200,6 +1365,21 @@ class DraftEvidenceSession:
             return
         if tc_endpoint:
             exchange = _tc_upload_exchange(response, data, observed_at, sns_fields, allowed_hosts=self.tc_cdn_hosts)
+            if tc_endpoint == 'allocate':
+                query = _tc_cdn_query(urlparse(response.url).query)
+                if query is not None and query.get('UploadID'):
+                    result = data.get('ListPartsResult') if isinstance(data, dict) else None
+                    parts = result.get('Part') if isinstance(result, dict) else None
+                    try:
+                        print('DRAFT_DIAGNOSTIC=' + json.dumps({
+                            'event': 'tencent_upload_confirmation', 'http_status': response.status,
+                            'parsed': exchange is not None, 'list_parts_result_present': isinstance(result, dict),
+                            'part_count': len(parts) if isinstance(parts, list) else None,
+                            'truncated': result.get('IsTruncated') if isinstance(result, dict) and result.get('IsTruncated') in ('true', 'false') else None,
+                            'next_marker_valid': isinstance(result, dict) and _tc_part_number(result.get('NextPartNumberMarker')) is not None,
+                        }), flush=True)
+                    except Exception:
+                        pass
             if exchange:
                 is_cover = any(asset['kind'] == 'cover' and exchange['metadata'] == (asset['name'], asset['size'])
                                for asset in self.assets.values())
@@ -1222,6 +1402,8 @@ class DraftEvidenceSession:
                     _tc_draft_diagnostic(kind, response.status, body, data)
                 return
             if self.platform == 'tencent' and kind == 'readlist':
+                if self.tc_preview_observer is not None and not self.tc_preview_observer.current():
+                    return
                 records = _tc_draft_list_records(data.get('data'), self.account.get('uid'))
                 matched = None
                 # A list read is positive evidence only after the normal UI
@@ -1236,10 +1418,31 @@ class DraftEvidenceSession:
                                field_match(self.platform, item, self.expected)]
                     if len(matches) == 1:
                         matched = matches[0]
+                        try:
+                            request_at = response.request.timing.get('startTime') / 1000
+                        except (AttributeError, TypeError, ValueError):
+                            request_at = None
                         matched.update(observed_at=observed_at, fresh=False,
-                                       request_method=response.request.method)
+                                       request_method=response.request.method, tc_normal_read='get_draft_list',
+                                       request_at=request_at)
+                        from uploader.tc_preview_evidence import browser_response_times
+                        timing = browser_response_times(response, self.reopen_at)
+                        matched['tc_response_start_at'] = timing['response_start']
+                        matched['tc_response_end_at'] = timing['response_end']
                         self.reads.append(matched)
-                _tc_draft_diagnostic(kind, response.status, body, data, matched)
+                list_gate = None
+                try:
+                    from uploader.tc_reopen_mapping import list_diagnostic
+                    list_gate = list_diagnostic(data.get('data'), records, saved, matched)
+                    if list_gate['target_count'] == 1 and self.tc_first_target_gate is None:
+                        self.tc_first_target_gate = {k: list_gate[k] for k in ('target_handle_status', 'target_media_schema_valid')}
+                    if self.tc_first_target_gate is not None:
+                        list_gate['first_target'] = self.tc_first_target_gate
+                    list_gate['response_start_timing_valid'] = matched is not None and matched.get('tc_response_start_at') is not None
+                    list_gate['response_end_timing_valid'] = matched is not None and matched.get('tc_response_end_at') is not None
+                except Exception:
+                    pass
+                _tc_draft_diagnostic(kind, response.status, body, data, matched, list_gate=list_gate)
                 return
             record_id = _first(value, 'draft_id', 'draftId', 'id', 'objectId') or _first(body, 'draft_id', 'draftId', 'id', 'objectId') or _first(query, 'draft_id', 'draftId', 'id', 'objectId')
             raw = body if kind == 'save' else value
@@ -1248,6 +1451,15 @@ class DraftEvidenceSession:
                 raw = value['draftInfo']
             record = parse_record(self.platform, raw, record_id, self.account.get('uid'))
             if record:
+                if self.platform == 'kuaishou' and kind == 'read':
+                    from uploader.ks_reopened_assets import native_ks_snapshot_response
+                    if native_ks_snapshot_response(self.page, response, observed_at, self.reopen_at):
+                        source = raw.get('url')
+                        if isinstance(source, str) and 0 < len(source) <= 8192:
+                            record['ks_preview_source'] = source
+                            record['ks_preview_scope_bound'] = True
+                        if type(data.get('currentTime')) is int and data['currentTime'] > 0:
+                            record['ks_current_time'] = data['currentTime']
                 record.update(observed_at=observed_at, fresh=kind == 'save', request_method=response.request.method)
                 (self.saves if kind == 'save' else self.reads).append(record)
             if self.platform == 'tencent':
@@ -1291,6 +1503,8 @@ class DraftEvidenceSession:
             await self.tc_cover_observer.drain()
         if self.tc_processing_observer is not None:
             await self.tc_processing_observer.drain()
+        if self.tc_sdk_observer is not None:
+            await self.tc_sdk_observer.drain()
         if self.ks_observer is not None:
             await self.ks_observer.drain()
         if self.bili_observer is not None:
@@ -1532,15 +1746,10 @@ class DraftEvidenceSession:
                         item['observed_at'] >= allocation['observed_at'] and len(item['parts']) == len(allocation['plan'])]
             resources = set()
             for finish in finishes:
-                chunks = [item for item in dfs if 'part_number' in item and item['task_id'] == task and
-                          item['upload_id'] == upload_id and item['metadata'] == allocation['metadata'] and
-                          allocation['observed_at'] <= item['observed_at'] <= finish['observed_at']]
-                observed = {}
-                for chunk in chunks:
-                    observed.setdefault(chunk['part_number'], set()).add(chunk['etag'])
-                if observed != {number: {etag} for number, etag in finish['parts']}:
+                chunks, projection = _tc_dfs_chain_projection(allocation, finish, dfs)
+                if not projection['fresh_part_coverage'] or not projection['part_etags_match']:
                     continue
-                if not any(chunk.get('trans_flag') == finish['trans_flag'] for chunk in chunks):
+                if not projection['part_flag_matches']:
                     continue
                 if kind == 'cover' and (len(allocation['plan']) != 1 or not any(
                         chunk.get('body_sha256') == selected['sha256'] for chunk in chunks)):
@@ -1550,8 +1759,19 @@ class DraftEvidenceSession:
                 links.append({'kind': kind, 'sha256': selected['sha256'], 'ids': list(resources.pop()), 'complete': True})
         return links
 
+    def tc_upload_chain_diagnostics(self):
+        """No ETag, resource, task, file name, account or credential values."""
+        dfs = [item for item in self.exchanges if item.get('tc_protocol') == 'dfs']
+        return [_tc_dfs_chain_projection(allocation, finish, dfs)[1]
+                for finish in dfs if finish.get('stage') == 'complete'
+                for allocation in dfs if 'plan' in allocation and
+                allocation['task_id'] == finish['task_id'] and allocation['upload_id'] == finish['upload_id'] and
+                allocation['metadata'] == finish['metadata']]
+
     def upload_links(self):
         links = self._tc_upload_links() if self.platform == 'tencent' else []
+        if self.tc_sdk_observer is not None and not any(x.get('kind') == 'video' for x in links):
+            links.extend(self.tc_sdk_observer.upload_links())
         allocated = []
         for exchange in sorted(self.exchanges, key=lambda item: item['observed_at']):
             if exchange.get('tc_protocol'):
@@ -1646,6 +1866,8 @@ class DraftEvidenceSession:
 
     async def close(self):
         if not self.closed:
+            if self.tc_preview_observer is not None:
+                await self.tc_preview_observer.close()
             self.closed = True
             self.page.remove_listener('response', self.handler)
             await self.drain()
@@ -1655,6 +1877,8 @@ class DraftEvidenceSession:
                 await self.tc_cover_observer.close()
             if self.tc_processing_observer is not None:
                 await self.tc_processing_observer.close()
+            if self.tc_sdk_observer is not None:
+                await self.tc_sdk_observer.close()
             if self.ks_observer is not None:
                 await self.ks_observer.close()
             if self.bili_observer is not None:
